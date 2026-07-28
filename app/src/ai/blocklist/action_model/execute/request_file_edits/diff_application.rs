@@ -8,8 +8,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use ai::diff_validation::{
-    fuzzy_match_diffs, fuzzy_match_v4a_diffs, AIRequestedCodeDiff, DiffDelta, DiffMatchFailure,
-    DiffMatchFailures, DiffType, ParsedDiff, SearchAndReplace, V4AHunk,
+    AIRequestedCodeDiff, DiffDelta, DiffMatchFailure, DiffMatchFailures, DiffType, ParsedDiff,
+    SearchAndReplace, V4AHunk, fuzzy_match_diffs, fuzzy_match_v4a_diffs,
 };
 use itertools::Itertools;
 use vec1::Vec1;
@@ -676,30 +676,30 @@ async fn apply_search_replace<F, Fut>(
 
             // Add warnings from the failure info - the `DiffMatchFailures` type includes both
             // fatal and non-fatal errors.
-            if let Some(failures) = fuzzy_match_diffs.failures.as_ref() {
-                if failures.missing_line_numbers > 0 {
-                    result.warnings.push(DiffWarning::MissingLineNumbers {
-                        count: failures.missing_line_numbers,
-                    });
-                }
+            if let Some(failures) = fuzzy_match_diffs.failures.as_ref()
+                && failures.missing_line_numbers > 0
+            {
+                result.warnings.push(DiffWarning::MissingLineNumbers {
+                    count: failures.missing_line_numbers,
+                });
             }
 
-            if fuzzy_match_diffs.warrants_failure() {
-                if let Some(failures) = fuzzy_match_diffs.failures.as_ref() {
-                    safe_warn!(
-                        safe: (
-                            "Failure(s) applying diff: {} unmatched, {} noop, {} missing line numbers",
-                            failures.fuzzy_match_failures,
-                            failures.noop_deltas,
-                            failures.missing_line_numbers
-                        ),
-                        full: ("Failure(s) applying diff for {absolute_path:?}: {failures:?}")
-                    );
-                    result.errors.push(DiffApplicationError::UnmatchedDiffs {
-                        file: file_path.clone(),
-                        match_failures: failures.clone(),
-                    });
-                }
+            if fuzzy_match_diffs.warrants_failure()
+                && let Some(failures) = fuzzy_match_diffs.failures.as_ref()
+            {
+                safe_warn!(
+                    safe: (
+                        "Failure(s) applying diff: {} unmatched, {} noop, {} missing line numbers",
+                        failures.fuzzy_match_failures,
+                        failures.noop_deltas,
+                        failures.missing_line_numbers
+                    ),
+                    full: ("Failure(s) applying diff for {absolute_path:?}: {failures:?}")
+                );
+                result.errors.push(DiffApplicationError::UnmatchedDiffs {
+                    file: file_path.clone(),
+                    match_failures: failures.clone(),
+                });
             }
             result.diffs.push(fuzzy_match_diffs);
         }
@@ -854,22 +854,22 @@ async fn apply_v4a_update<F, Fut>(
     } else {
         // Normal case: no rename or rename to non-existent file
         let diffs = fuzzy_match_v4a_diffs(&file_path, &deltas, rename_to, file_content);
-        if diffs.warrants_failure() {
-            if let Some(failures) = diffs.failures.as_ref() {
-                safe_warn!(
-                    safe: (
-                        "Failure(s) applying V4A diff: {} unmatched, {} noop, {} missing line numbers",
-                        failures.fuzzy_match_failures,
-                        failures.noop_deltas,
-                        failures.missing_line_numbers
-                    ),
-                    full: ("Failure(s) applying V4A diff for {absolute_path:?}: {failures:?}")
-                );
-                result.errors.push(DiffApplicationError::UnmatchedDiffs {
-                    file: file_path.clone(),
-                    match_failures: failures.clone(),
-                });
-            }
+        if diffs.warrants_failure()
+            && let Some(failures) = diffs.failures.as_ref()
+        {
+            safe_warn!(
+                safe: (
+                    "Failure(s) applying V4A diff: {} unmatched, {} noop, {} missing line numbers",
+                    failures.fuzzy_match_failures,
+                    failures.noop_deltas,
+                    failures.missing_line_numbers
+                ),
+                full: ("Failure(s) applying V4A diff for {absolute_path:?}: {failures:?}")
+            );
+            result.errors.push(DiffApplicationError::UnmatchedDiffs {
+                file: file_path.clone(),
+                match_failures: failures.clone(),
+            });
         }
         result.diffs.push(diffs);
     }

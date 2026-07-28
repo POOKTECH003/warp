@@ -12,6 +12,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::color::internal_colors;
+use warp_errors::report_error;
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
     Align, Border, ChildAnchor, ClippedScrollStateHandle, ConstrainedBox, Container, CornerRadius,
@@ -31,16 +32,16 @@ use warpui::{
     ViewContext, ViewHandle,
 };
 
+use super::SettingsSection;
 use super::admin_actions::AdminActions;
 use super::settings_page::{
-    render_customer_type_badge, render_separator, render_sub_header, MatchData, PageType,
-    SettingsPageMeta, SettingsPageViewHandle, SettingsWidget,
+    MatchData, PageType, SettingsPageMeta, SettingsPageViewHandle, SettingsWidget,
+    render_customer_type_badge, render_separator, render_sub_header,
 };
 use super::tab_menu::Tabs;
 use super::transfer_ownership_confirmation_modal::{
     TransferOwnershipConfirmationEvent, TransferOwnershipConfirmationModal,
 };
-use super::SettingsSection;
 use crate::ai::AIRequestUsageModel;
 use crate::appearance::Appearance;
 use crate::auth::auth_manager::{AuthManager, LoginGatedFeature};
@@ -105,14 +106,14 @@ const TEXT_FIELD_TOP_PADDING: f32 = 12.;
 const HORIZONTAL_BAR_TO_SUB_HEADER_PADDING: f32 = 9.;
 const SUBSECTION_HEADER_FONT_SIZE: f32 = 18.;
 const SUBSUBSECTION_HEADER_FONT_SIZE: f32 = 14.;
+const OWNER_STATE_CHIP_ACCENT_OPACITY: u8 = 30;
 
 const INVITE_LINK_PREFIX: &str = "/team/";
 const INVALID_DOMAINS_INSTRUCTIONS: &str =
     "Some of the provided domains are invalid, or have already been added.";
 
 const INVITE_LINK_TOGGLE_INSTRUCTIONS: &str = "As an admin, you can choose whether to enable or disable the ability for team members to invite others by invitation link.";
-const INVITE_LINK_DOMAIN_RESTRICTIONS_INSTRUCTIONS: &str =
-    "Restrict by domain — only allow users with emails at specific domains to join your team through the invite link.";
+const INVITE_LINK_DOMAIN_RESTRICTIONS_INSTRUCTIONS: &str = "Restrict by domain — only allow users with emails at specific domains to join your team through the invite link.";
 
 const INVITE_BY_EMAIL_EXPIRY_INSTRUCTIONS: &str = "Email invitations are valid for 7 days.";
 const INVALID_EMAILS_INSTRUCTIONS: &str =
@@ -130,6 +131,13 @@ lazy_static! {
     static ref PAST_DUE_BADGE_COLOR: ColorU = ColorU::new(254, 253, 194, 255);
     static ref UNPAID_BADGE_COLOR: ColorU = ColorU::new(255, 130, 114, 255);
     static ref DELINQUENCY_BADGE_TEXT_COLOR: ColorU = ColorU::new(0, 0, 0, 190);
+}
+
+fn owner_state_chip_text_color(theme: &themes::theme::WarpTheme) -> ColorU {
+    let chip_background = theme
+        .background()
+        .blend(&theme.accent().with_opacity(OWNER_STATE_CHIP_ACCENT_OPACITY));
+    theme.main_text_color(chip_background).into_solid()
 }
 
 #[derive(Debug, Clone)]
@@ -1011,7 +1019,7 @@ impl TeamsPageView {
             }
             UserWorkspacesEvent::FetchDiscoverableTeamsRejected(e) => {
                 // Don't show toast, only log to sentry
-                log::error!("Failed to fetch discoverable teams: {e:?}");
+                report_error!(e);
             }
             UserWorkspacesEvent::TransferTeamOwnershipSuccess => {
                 self.show_success("Successfully transferred team ownership", ctx);
@@ -1419,9 +1427,9 @@ impl TeamsPageView {
 
         // Log error to sentry
         if let Some(error) = error {
-            log::error!("{message}: {error:#}");
+            report_error!(error);
         } else {
-            log::error!("{message}");
+            report_error!(anyhow::Error::msg(message.clone()));
         }
     }
 
@@ -2573,50 +2581,48 @@ impl TeamsWidget {
         let mut shared_objects_usage_row =
             Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
 
-        if let Some(policy) = team.billing_metadata.tier.shared_notebooks_policy {
-            if !policy.is_unlimited {
-                let mut shared_notebooks_column = Flex::column();
-                shared_notebooks_column.add_child(
-                    self.render_plan_usage_header("Shared Notebooks".into(), appearance),
-                );
-                let num_shared_notebooks = cloud_model
-                    .active_notebooks_in_space(Space::Team { team_uid: team.uid }, app)
-                    .count();
-                shared_notebooks_column.add_child(
-                    Container::new(self.render_plan_usage_text(
-                        format!("{}/{}", num_shared_notebooks, policy.limit),
-                        appearance,
-                    ))
-                    .with_margin_top(4.)
+        if let Some(policy) = team.billing_metadata.tier.shared_notebooks_policy
+            && !policy.is_unlimited
+        {
+            let mut shared_notebooks_column = Flex::column();
+            shared_notebooks_column
+                .add_child(self.render_plan_usage_header("Shared Notebooks".into(), appearance));
+            let num_shared_notebooks = cloud_model
+                .active_notebooks_in_space(Space::Team { team_uid: team.uid }, app)
+                .count();
+            shared_notebooks_column.add_child(
+                Container::new(self.render_plan_usage_text(
+                    format!("{}/{}", num_shared_notebooks, policy.limit),
+                    appearance,
+                ))
+                .with_margin_top(4.)
+                .finish(),
+            );
+            shared_objects_usage_row.add_child(
+                Container::new(shared_notebooks_column.finish())
+                    .with_margin_right(64.)
                     .finish(),
-                );
-                shared_objects_usage_row.add_child(
-                    Container::new(shared_notebooks_column.finish())
-                        .with_margin_right(64.)
-                        .finish(),
-                );
-            }
+            );
         }
 
-        if let Some(policy) = team.billing_metadata.tier.shared_workflows_policy {
-            if !policy.is_unlimited {
-                let mut shared_workflows_column = Flex::column();
-                shared_workflows_column.add_child(
-                    self.render_plan_usage_header("Shared Workflows".into(), appearance),
-                );
-                let num_shared_workflows = cloud_model
-                    .active_workflows_in_space(Space::Team { team_uid: team.uid }, app)
-                    .count();
-                shared_workflows_column.add_child(
-                    Container::new(self.render_plan_usage_text(
-                        format!("{}/{}", num_shared_workflows, policy.limit),
-                        appearance,
-                    ))
-                    .with_margin_top(4.)
-                    .finish(),
-                );
-                shared_objects_usage_row.add_child(shared_workflows_column.finish());
-            }
+        if let Some(policy) = team.billing_metadata.tier.shared_workflows_policy
+            && !policy.is_unlimited
+        {
+            let mut shared_workflows_column = Flex::column();
+            shared_workflows_column
+                .add_child(self.render_plan_usage_header("Shared Workflows".into(), appearance));
+            let num_shared_workflows = cloud_model
+                .active_workflows_in_space(Space::Team { team_uid: team.uid }, app)
+                .count();
+            shared_workflows_column.add_child(
+                Container::new(self.render_plan_usage_text(
+                    format!("{}/{}", num_shared_workflows, policy.limit),
+                    appearance,
+                ))
+                .with_margin_top(4.)
+                .finish(),
+            );
+            shared_objects_usage_row.add_child(shared_workflows_column.finish());
         }
 
         section.add_child(
@@ -3502,14 +3508,20 @@ impl TeamsWidget {
                         );
                     }
                     ItemState::Owner => {
-                        pending_and_close_row.add_child(self.render_state_chip(
-                            appearance,
-                            "OWNER".into(),
-                            appearance.theme().accent().into(),
-                            appearance.theme().accent().with_opacity(30).into(),
-                            appearance.ui_font_size() - 1.,
-                            Weight::Normal,
-                        ));
+                        pending_and_close_row.add_child(
+                            self.render_state_chip(
+                                appearance,
+                                "OWNER".into(),
+                                owner_state_chip_text_color(appearance.theme()),
+                                appearance
+                                    .theme()
+                                    .accent()
+                                    .with_opacity(OWNER_STATE_CHIP_ACCENT_OPACITY)
+                                    .into(),
+                                appearance.ui_font_size() - 1.,
+                                Weight::Normal,
+                            ),
+                        );
                     }
                     ItemState::Admin => {
                         pending_and_close_row.add_child(
@@ -3635,15 +3647,13 @@ impl TeamsWidget {
                 let list_element =
                     Container::new(row.finish()).with_uniform_padding(SCROLLABLE_LIST_ITEM_PADDING);
 
-                let container = if idx % 2 == 0 {
+                if idx % 2 == 0 {
                     list_element
                         .with_background(internal_colors::fg_overlay_1(appearance.theme()))
                         .finish()
                 } else {
                     list_element.finish()
-                };
-
-                container
+                }
             })
             .collect::<Vec<_>>()
             .into_iter();
@@ -4423,4 +4433,31 @@ pub fn test_valid_domains() {
     assert!(TeamsPageView::is_valid_domain("warp0.dev0"));
     assert!(TeamsPageView::is_valid_domain("warp.dev"));
     assert!(TeamsPageView::is_valid_domain("miniclip.com"));
+}
+
+#[cfg(test)]
+#[test]
+pub fn test_owner_state_chip_text_contrasts_with_accent_overlay() {
+    let theme_config = themes::theme::WarpThemeConfig::new();
+
+    for theme_kind in [
+        themes::theme::ThemeKind::CyberWave,
+        themes::theme::ThemeKind::WillowDream,
+        themes::theme::ThemeKind::SolarFlare,
+    ] {
+        let theme = theme_config.theme(&theme_kind);
+        let chip_background = theme
+            .background()
+            .blend(&theme.accent().with_opacity(OWNER_STATE_CHIP_ACCENT_OPACITY));
+        let text_color = owner_state_chip_text_color(&theme);
+
+        assert!(
+            crate::util::color::high_enough_contrast(
+                text_color,
+                chip_background.into_solid(),
+                crate::util::color::MinimumAllowedContrast::Text,
+            ),
+            "{theme_kind} owner chip text should contrast with its accent overlay"
+        );
+    }
 }

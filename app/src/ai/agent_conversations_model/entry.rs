@@ -5,9 +5,9 @@ use warp_core::features::FeatureFlag;
 use warpui::{AppContext, SingletonEntity};
 
 use super::{
-    artifacts_match_filter, AgentManagementFilters, AgentRunDisplayStatus, ArtifactFilter,
-    ConversationMetadata, CreatedOnFilter, CreatorFilter, EnvironmentFilter, HarnessFilter,
-    OwnerFilter, SessionStatus, SourceFilter, StatusFilter,
+    AgentManagementFilters, AgentRunDisplayStatus, ArtifactFilter, ConversationMetadata,
+    CreatedOnFilter, CreatorFilter, EnvironmentFilter, HarnessFilter, OwnerFilter, SessionStatus,
+    SourceFilter, StatusFilter, artifacts_match_filter,
 };
 use crate::ai::active_agent_views_model::{ActiveAgentViewsModel, ConversationOrTaskId};
 use crate::ai::agent::api::ServerConversationToken;
@@ -19,7 +19,7 @@ use crate::ai::conversation_navigation::ConversationNavigationData;
 use crate::auth::{AuthStateProvider, UserUid};
 use crate::util::time_format::human_readable_precise_duration;
 use crate::workspace::RestoreConversationLayout;
-use crate::workspaces::user_profiles::UserProfiles;
+use crate::workspaces::user_profiles::{UserProfileWithUID, UserProfiles};
 
 const SESSION_EXPIRATION_TIME: chrono::Duration = chrono::Duration::weeks(1);
 
@@ -166,6 +166,13 @@ pub struct AgentConversationCapabilities {
 }
 
 impl AgentConversationEntry {
+    /// Returns whether this entry represents a cloud agent run.
+    pub fn is_cloud_agent_run(&self) -> bool {
+        matches!(self.provenance, AgentConversationProvenance::AmbientRun)
+            || self.backing.has_ambient_run
+            || self.identity.ambient_agent_task_id.is_some()
+    }
+
     pub(super) fn matches_filters(
         &self,
         filters: &AgentManagementFilters,
@@ -405,6 +412,47 @@ fn conversation_artifacts(
         .unwrap_or_default()
 }
 
+fn principal_from_user_profile(profile: &UserProfileWithUID) -> AgentConversationPrincipal {
+    let name = profile
+        .display_name
+        .as_ref()
+        .filter(|name| !name.is_empty())
+        .or_else(|| (!profile.email.is_empty()).then_some(&profile.email))
+        .cloned()
+        .or_else(|| Some(profile.firebase_uid.to_string()));
+
+    AgentConversationPrincipal {
+        name,
+        uid: Some(profile.firebase_uid.to_string()),
+        principal_type: Some(PrincipalType::User),
+    }
+}
+
+fn conversation_creator(
+    metadata: &ConversationMetadata,
+    history_model: &BlocklistAIHistoryModel,
+    app: &AppContext,
+) -> AgentConversationPrincipal {
+    let server_metadata = history_model.get_server_conversation_metadata(&metadata.nav_data.id);
+    if let Some(profile) = server_metadata.and_then(|metadata| metadata.creator.as_ref()) {
+        return principal_from_user_profile(profile);
+    }
+
+    if let Some(uid) = server_metadata.and_then(|metadata| metadata.metadata.creator_uid.as_ref()) {
+        return AgentConversationPrincipal {
+            name: UserProfiles::as_ref(app).displayable_identifier_for_uid(UserUid::new(uid)),
+            uid: Some(uid.clone()),
+            principal_type: Some(PrincipalType::User),
+        };
+    }
+
+    AgentConversationPrincipal {
+        name: current_user_name(app),
+        uid: current_user_uid(app),
+        principal_type: Some(PrincipalType::User),
+    }
+}
+
 pub(super) fn entry_for_task(
     task: &AmbientAgentTask,
     history_model: &BlocklistAIHistoryModel,
@@ -573,11 +621,7 @@ fn entry_for_conversation_parts(
             created_at: metadata.nav_data.last_updated.into(),
             last_updated: metadata.nav_data.last_updated.into(),
             status: status.clone(),
-            creator: AgentConversationPrincipal {
-                name: current_user_name(app),
-                uid: current_user_uid(app),
-                principal_type: Some(PrincipalType::User),
-            },
+            creator: conversation_creator(&metadata, history_model, app),
             executor: None,
             request_usage: conversation_request_usage(&metadata, history_model),
             run_time: None,

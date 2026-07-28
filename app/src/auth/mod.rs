@@ -1,19 +1,16 @@
-pub mod anonymous_id;
 pub mod auth_manager;
 mod auth_override_warning_body;
 pub mod auth_override_warning_modal;
-pub mod auth_state;
 mod auth_view_body;
 pub mod auth_view_modal;
 mod auth_view_shared_helpers;
-pub mod credentials;
 mod login_error_modal;
 mod login_failure_notification;
 pub mod login_slide;
 pub mod needs_sso_link_view;
 pub mod paste_auth_token_modal;
-pub mod user;
-pub mod user_uid;
+mod user_properties;
+pub use warp_server_auth::{auth_state, credentials, user, user_uid};
 #[cfg(target_family = "wasm")]
 pub mod web_handoff;
 
@@ -24,14 +21,18 @@ pub use auth_state::AuthStateProvider;
 use itertools::Itertools;
 pub use login_failure_notification::LoginFailureReason;
 pub use user_uid::UserUid;
+use warp_core::channel::ChannelState;
 use warp_core::user_preferences::GetUserPreferences as _;
+use warp_errors::{report_error, report_if_error};
 use warpui::modals::{AlertDialogWithCallbacks, ModalButton};
 use warpui::{AppContext, SingletonEntity};
 
 use crate::ai::agent_conversations_model::AgentConversationsModel;
-use crate::ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::ai_assistant::requests::REQUEST_LIMIT_INFO_CACHE_KEY;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::code::editor_management::{CodeEditorStatus, CodeEditorSummary};
@@ -43,7 +44,7 @@ use crate::server::sync_queue::SyncQueue;
 use crate::server::telemetry::{PaletteSource, TelemetryEvent};
 use crate::session_management::{RunningSessionSummary, SessionNavigationData};
 use crate::settings::{
-    CloudPreferencesSettings, PrivacySettings, CRASH_REPORTING_ENABLED_DEFAULTS_KEY,
+    AISettings, CRASH_REPORTING_ENABLED_DEFAULTS_KEY, CloudPreferencesSettings, PrivacySettings,
     TELEMETRY_ENABLED_DEFAULTS_KEY,
 };
 use crate::terminal::general_settings::GeneralSettings;
@@ -52,13 +53,9 @@ use crate::workflows::manager::WorkflowManager;
 use crate::workspace::{Workspace, WorkspaceAction};
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::{
-    focus_running_window_and_show_native_modal, persistence, report_if_error,
-    send_telemetry_sync_from_app_ctx, GlobalResourceHandlesProvider,
+    GlobalResourceHandlesProvider, focus_running_window_and_show_native_modal, persistence,
+    send_telemetry_sync_from_app_ctx,
 };
-
-/// Prefix for API keys used in authentication
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
-pub const API_KEY_PREFIX: &str = "wk-";
 
 pub fn init(app: &mut AppContext) {
     auth_view_modal::init(app);
@@ -66,6 +63,17 @@ pub fn init(app: &mut AppContext) {
     auth_override_warning_body::init(app);
     login_slide::init(app);
     paste_auth_token_modal::init(app);
+}
+
+/// Returns the configured Warp web logout URL.
+///
+/// Keep this derived from the channel's server root so local and non-production
+/// builds log out of the same web session they use for authentication.
+pub fn web_logout_url() -> String {
+    format!(
+        "{}/logout",
+        ChannelState::server_root_url().trim_end_matches('/')
+    )
 }
 
 /// If the app has running processes or dirty objects, we'll show a confirmation modal before logging out.
@@ -97,7 +105,7 @@ pub fn maybe_log_out(app: &mut AppContext) {
     {
         send_telemetry_sync_from_app_ctx!(TelemetryEvent::LogOutModalShown, app);
         let mut button_data = vec![ModalButton::for_app("Yes, log out", |ctx| {
-            log_out(ctx);
+            log_out_and_open_web(ctx);
         })];
 
         let mut info_text_vec: Vec<String> = vec![];
@@ -127,18 +135,18 @@ pub fn maybe_log_out(app: &mut AppContext) {
                     return;
                 };
 
-                if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id) {
-                    if let Some(handle) = workspaces.first() {
-                        ctx.dispatch_typed_action_for_view(
-                            window_id,
-                            handle.id(),
-                            &WorkspaceAction::OpenPalette {
-                                mode: PaletteMode::Navigation,
-                                source: PaletteSource::LogOutModal,
-                                query: Some("running".to_owned()),
-                            },
-                        );
-                    }
+                if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id)
+                    && let Some(handle) = workspaces.first()
+                {
+                    ctx.dispatch_typed_action_for_view(
+                        window_id,
+                        handle.id(),
+                        &WorkspaceAction::OpenPalette {
+                            mode: PaletteMode::Navigation,
+                            source: PaletteSource::LogOutModal,
+                            query: Some("running".to_owned()),
+                        },
+                    );
                 }
             }))
         }
@@ -189,9 +197,11 @@ pub fn maybe_log_out(app: &mut AppContext) {
             button_data,
             move |ctx| {
                 GeneralSettings::handle(ctx).update(ctx, |general_settings, ctx| {
-                    report_if_error!(general_settings
-                        .show_warning_before_quitting
-                        .toggle_and_save_value(ctx));
+                    report_if_error!(
+                        general_settings
+                            .show_warning_before_quitting
+                            .toggle_and_save_value(ctx)
+                    );
                 });
             },
         );
@@ -206,8 +216,19 @@ pub fn maybe_log_out(app: &mut AppContext) {
             focus_running_window_and_show_native_modal(sessions_summary, alert_data, app);
         }
     } else {
-        log_out(app);
+        log_out_and_open_web(app);
     }
+}
+
+/// Logs out locally and sends the user to Warp web's logout endpoint.
+///
+/// This is intentionally separate from [`log_out`], which is also used for
+/// non-user-initiated auth recovery paths where opening a browser would be
+/// surprising.
+pub fn log_out_and_open_web(app: &mut AppContext) {
+    log_out(app);
+    let logout_url = web_logout_url();
+    app.open_url(&logout_url);
 }
 
 // Log out the user, clears workspace state, stops running processes, and deletes database.
@@ -227,8 +248,11 @@ pub fn log_out(app: &mut AppContext) {
     AuthManager::handle(app).update(app, |auth_manager, ctx| {
         auth_manager.log_out(ctx);
     });
-    AIExecutionProfilesModel::handle(app).update(app, |ai_execution_profiles_model, _| {
-        ai_execution_profiles_model.reset();
+    // Detach built-in Warp-hosted MCP servers; they authenticate with the
+    // credentials that were just cleared.
+    #[cfg(not(target_family = "wasm"))]
+    TemplatableMCPServerManager::handle(app).update(app, |manager, ctx| {
+        manager.sync_builtin_servers(false, ctx);
     });
     BlocklistAIHistoryModel::handle(app).update(app, |history_model, _| {
         history_model.reset();
@@ -255,6 +279,14 @@ pub fn log_out(app: &mut AppContext) {
         manager.stop_polling_for_workspace_metadata_updates();
     });
     remove_cloud_persisted_settings(app);
+
+    let settings_profiles_are_explicit = AISettings::as_ref(app)
+        .execution_profiles
+        .is_value_explicitly_set();
+    AIExecutionProfilesModel::handle(app).update(app, |profiles, _| {
+        profiles.reset(settings_profiles_are_explicit);
+    });
+
     NotebookManager::handle(app).update(app, |manager, _| manager.reset());
     EnvVarCollectionManager::handle(app).update(app, |manager, _| manager.reset());
     WorkflowManager::handle(app).update(app, |manager, _| manager.reset());
@@ -294,7 +326,9 @@ fn remove_cloud_persisted_settings(app: &mut AppContext) {
         SettingsManager::handle(app).update(app, |settings_manager, ctx| {
             let errors = settings_manager.clear_cloud_settings_local_state(ctx);
             for e in errors {
-                log::error!("Failed to remove cloud synced setting from user defaults: {e:?}");
+                report_error!(
+                    e.context("Failed to remove cloud synced setting from user defaults")
+                );
             }
         });
     }
@@ -303,15 +337,20 @@ fn remove_cloud_persisted_settings(app: &mut AppContext) {
         .private_user_preferences()
         .remove_value(TELEMETRY_ENABLED_DEFAULTS_KEY)
     {
-        log::error!("Failed to remove Telemetry Enabled Defaults Key from user defaults: {e:?}");
+        report_error!(
+            anyhow::Error::new(e)
+                .context("Failed to remove Telemetry Enabled Defaults Key from user defaults")
+        );
     }
 
     if let Err(e) = app
         .private_user_preferences()
         .remove_value(CRASH_REPORTING_ENABLED_DEFAULTS_KEY)
     {
-        log::error!(
-            "Failed to remove Crash Reporting Enabled Defaults Key from user defaults: {e:?}"
+        report_error!(
+            anyhow::Error::new(e).context(
+                "Failed to remove Crash Reporting Enabled Defaults Key from user defaults"
+            )
         );
     }
 
@@ -319,7 +358,10 @@ fn remove_cloud_persisted_settings(app: &mut AppContext) {
         .private_user_preferences()
         .remove_value(REQUEST_LIMIT_INFO_CACHE_KEY)
     {
-        log::error!("Failed to remove Request Limit Defaults Key from user defaults: {e:?}");
+        report_error!(
+            anyhow::Error::new(e)
+                .context("Failed to remove Request Limit Defaults Key from user defaults")
+        );
     }
 
     // Reset the Privacy Settings in the login screen to default values.
@@ -327,3 +369,7 @@ fn remove_cloud_persisted_settings(app: &mut AppContext) {
         privacy_settings.refresh_to_default();
     });
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

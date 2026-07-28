@@ -8,6 +8,9 @@ use warp_core::channel::ChannelState;
 use warp_core::context_flag::ContextFlag;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::icons::Icon;
+use warp_errors::{report_error, report_if_error};
+#[cfg(not(target_family = "wasm"))]
+use warp_server_client::iap::{IapCredentialsState, IapManager, IapManagerEvent};
 use warpui::assets::asset_cache::AssetSource;
 use warpui::elements::{
     Align, Border, CacheOption, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
@@ -21,16 +24,16 @@ use warpui::ui_components::button::{ButtonVariant, TextAndIcon, TextAndIconAlign
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::ui_components::switch::SwitchStateHandle;
 use warpui::{
-    id, Action, AppContext, Entity, ModelHandle, SingletonEntity, TypedActionView, View,
-    ViewContext, ViewHandle,
+    Action, AppContext, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
+    ViewHandle, id,
 };
 
 use super::settings_page::{
-    render_body_item, render_customer_type_badge, AdditionalInfo, LocalOnlyIconState, MatchData,
-    PageType, SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, ToggleState,
-    HEADER_PADDING,
+    AdditionalInfo, HEADER_PADDING, LocalOnlyIconState, MatchData, PageType, SettingsPageMeta,
+    SettingsPageViewHandle, SettingsWidget, ToggleState, render_body_item,
+    render_customer_type_badge,
 };
-use super::{flags, SettingsAction, SettingsSection, ToggleSettingActionPair};
+use super::{SettingsAction, SettingsSection, ToggleSettingActionPair, flags};
 use crate::appearance::Appearance;
 use crate::auth::auth_manager::{AuthManager, LoginGatedFeature};
 use crate::auth::auth_state::AuthState;
@@ -43,7 +46,7 @@ use crate::workspace::WorkspaceAction;
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::workspaces::workspace::CustomerType;
-use crate::{report_if_error, send_telemetry_from_ctx, TelemetryEvent};
+use crate::{TelemetryEvent, send_telemetry_from_ctx};
 
 const PHOTO_SIZE: f32 = 40.;
 const REFERRAL_CTA: &str = "Earn rewards by sharing Warp with friends & colleagues";
@@ -122,6 +125,8 @@ pub enum MainPageAction {
     },
     SignupAnonymousUser,
     OpenUrl(String),
+    #[cfg(not(target_family = "wasm"))]
+    RefreshIapCredentials,
 }
 
 impl MainPageAction {
@@ -197,9 +202,11 @@ impl TypedActionView for MainSettingsPageView {
             MainPageAction::ToggleSettingsSync => {
                 let new_value =
                     CloudPreferencesSettings::handle(ctx).update(ctx, |prefs_settings, ctx| {
-                        report_if_error!(prefs_settings
-                            .settings_sync_enabled
-                            .toggle_and_save_value(ctx));
+                        report_if_error!(
+                            prefs_settings
+                                .settings_sync_enabled
+                                .toggle_and_save_value(ctx)
+                        );
                         *prefs_settings.settings_sync_enabled
                     });
                 send_telemetry_from_ctx!(
@@ -228,6 +235,11 @@ impl TypedActionView for MainSettingsPageView {
             }
             MainPageAction::OpenUrl(url) => {
                 ctx.open_url(url);
+            }
+            #[cfg(not(target_family = "wasm"))]
+            MainPageAction::RefreshIapCredentials => {
+                IapManager::handle(ctx).update(ctx, |manager, ctx| manager.start_refresh(ctx));
+                ctx.notify();
             }
         }
     }
@@ -270,6 +282,17 @@ impl MainSettingsPageView {
         widgets.push(Box::new(SettingsSyncWidget::default()));
 
         widgets.push(Box::new(EarnRewardsWidget::default()));
+
+        #[cfg(not(target_family = "wasm"))]
+        if IapManager::as_ref(ctx).is_enabled() {
+            widgets.push(Box::new(IapCredentialsWidget::default()));
+            let iap_manager_handle = IapManager::handle(ctx);
+            ctx.subscribe_to_model(&iap_manager_handle, |_, _, e, ctx| {
+                if matches!(e, IapManagerEvent::StateChanged) {
+                    ctx.notify();
+                }
+            })
+        }
 
         if ChannelState::app_version().is_some() {
             widgets.push(Box::new(VersionInfoWidget::default()));
@@ -402,7 +425,7 @@ impl AccountWidget {
         let mut user_info = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
         if let Some(profile_image_source) = profile_image_source {
             // Only continue if profile_image_source is a source with a non empty url/path
-            if matches!(profile_image_source, AssetSource::Async { ref id, .. } if !id.key().is_empty())
+            if matches!(profile_image_source, AssetSource::Async { id, .. } if !id.key().is_empty())
                 || matches!(profile_image_source, AssetSource::Bundled { path, .. } if !path.is_empty())
                 || matches!(profile_image_source, AssetSource::LocalFile { path, .. } if !path.is_empty())
             {
@@ -1022,7 +1045,7 @@ impl SettingsWidget for VersionInfoWidget {
                 .with_margin_top(VERTICAL_MARGIN)
                 .finish()
         } else {
-            log::error!("Shouldn't render VersionInfoWidget without GIT_RELEASE_TAG");
+            report_error!("Shouldn't render VersionInfoWidget without GIT_RELEASE_TAG");
             Empty::new().finish()
         }
     }
@@ -1049,6 +1072,117 @@ impl LogoutWidget {
                 ctx.dispatch_typed_action(WorkspaceAction::LogOut);
             })
             .finish()
+    }
+}
+
+/// Widget displaying IAP credential state and a refresh button. Only
+/// visible on staging channels where IAP is active.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Default)]
+struct IapCredentialsWidget {
+    refresh_button_mouse_state: MouseStateHandle,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl SettingsWidget for IapCredentialsWidget {
+    type View = MainSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "iap staging gcloud proxy credentials"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        // `is_enabled()` gates widget registration in `MainSettingsPageView::new`,
+        // so `state()` should be `Some` here; bail out defensively though.
+        let Some(state) = IapManager::as_ref(app).state() else {
+            return Empty::new().finish();
+        };
+        let ansi_red: ColorU = appearance.theme().terminal_colors().bright.red.into();
+        let disabled: ColorU = appearance.theme().disabled_ui_text_color().into();
+        let active: ColorU = appearance.theme().active_ui_text_color().into();
+        let (status_text, status_color): (String, ColorU) = match &state {
+            IapCredentialsState::Missing => ("Not yet loaded".to_string(), disabled),
+            IapCredentialsState::Refreshing { .. } => ("Refreshing…".to_string(), active),
+            IapCredentialsState::Loaded(cached) => {
+                let remaining = cached
+                    .expires_at
+                    .saturating_duration_since(instant::Instant::now());
+                let mins = remaining.as_secs() / 60;
+                (format!("Loaded (refreshes in ~{mins}m)"), active)
+            }
+            IapCredentialsState::Failed { message, .. } => (format!("Failed: {message}"), ansi_red),
+        };
+
+        let is_refreshing = matches!(state, IapCredentialsState::Refreshing { .. });
+
+        let label = Align::new(
+            Text::new_inline(
+                "Staging IAP credentials".to_string(),
+                appearance.ui_font_family(),
+                REGULAR_TEXT_FONT_SIZE,
+            )
+            .with_color(appearance.theme().active_ui_text_color().into())
+            .finish(),
+        )
+        .left()
+        .finish();
+
+        let status = Container::new(
+            appearance
+                .ui_builder()
+                .paragraph(status_text)
+                .with_style(UiComponentStyles {
+                    font_color: Some(status_color),
+                    font_size: Some(REGULAR_TEXT_FONT_SIZE),
+                    ..Default::default()
+                })
+                .build()
+                .finish(),
+        )
+        .with_margin_top(4.)
+        .finish();
+
+        let refresh_button = appearance
+            .ui_builder()
+            .button(
+                ButtonVariant::Secondary,
+                self.refresh_button_mouse_state.clone(),
+            )
+            .with_text_label(if is_refreshing {
+                "Refreshing…".into()
+            } else {
+                "Refresh".into()
+            })
+            .with_style(UiComponentStyles {
+                font_size: Some(12.),
+                padding: Some(Coords::uniform(6.).left(16.).right(16.)),
+                ..Default::default()
+            })
+            .build()
+            .on_click(|ctx, _, _| {
+                ctx.dispatch_typed_action(MainPageAction::RefreshIapCredentials);
+            })
+            .finish();
+
+        let button_row = Container::new(Align::new(refresh_button).left().finish())
+            .with_margin_top(8.)
+            .finish();
+
+        Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                .with_child(label)
+                .with_child(status)
+                .with_child(button_row)
+                .finish(),
+        )
+        .with_margin_top(VERTICAL_MARGIN)
+        .finish()
     }
 }
 

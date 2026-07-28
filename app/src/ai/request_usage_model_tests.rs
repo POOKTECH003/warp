@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use ai::api_keys::ApiKeyManager;
+use ai::LLMProvider;
+use ai::api_keys::{ApiKeyManager, GrokTokens};
 use chrono::Duration;
 use warp_core::features::FeatureFlag;
 use warp_graphql::billing::{AddonCreditsOption, OveragesPricing, PricingInfo};
@@ -9,9 +10,9 @@ use warpui::{App, ModelHandle};
 use super::*;
 use crate::auth::AuthStateProvider;
 use crate::pricing::PricingInfoModel;
+use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::team::MockTeamClient;
 use crate::server::server_api::workspace::MockWorkspaceClient;
-use crate::server::server_api::ServerApiProvider;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::workspaces::workspace::{
     AiOverages, ByoApiKeyPolicy, CustomerType, EnterpriseCreditsAutoReloadPolicy,
@@ -46,8 +47,22 @@ fn add_request_usage_model_for_anonymous_users(app: &mut App) -> ModelHandle<AIR
     add_request_usage_model_without_auth(app)
 }
 
+fn add_request_usage_model_for_logged_out_users(app: &mut App) -> ModelHandle<AIRequestUsageModel> {
+    app.add_singleton_model(|_| AuthStateProvider::new_logged_out_for_test());
+    add_request_usage_model_without_auth(app)
+}
+fn register_user_preferences_for_tests(app: &mut App) {
+    if app
+        .models_of_type::<settings::PrivatePreferences>()
+        .is_empty()
+    {
+        app.update(crate::settings::init_and_register_user_preferences);
+    }
+}
+
 fn add_request_usage_model_without_auth(app: &mut App) -> ModelHandle<AIRequestUsageModel> {
     app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+    register_user_preferences_for_tests(app);
     app.update(|ctx| {
         warpui_extras::secure_storage::register_noop("test", ctx);
         ctx.add_singleton_model(ApiKeyManager::new);
@@ -87,6 +102,16 @@ fn enable_auto_reload(workspace: &mut Workspace) {
         .selected_auto_reload_credit_denomination = Some(1000);
 }
 
+#[test]
+fn refresh_request_usage_returns_no_fresh_limit_when_logged_out() {
+    App::test((), |mut app| async move {
+        let request_usage_model = add_request_usage_model_for_logged_out_users(&mut app);
+        let refresh =
+            request_usage_model.update(&mut app, |model, ctx| model.refresh_request_usage(ctx));
+
+        assert_eq!(refresh.await.unwrap(), None);
+    });
+}
 #[test]
 fn test_request_limit_info() {
     App::test((), |mut app| async move {
@@ -303,6 +328,45 @@ fn test_buy_credits_banner_shows_when_non_ambient_bonus_credits_are_depleted() {
                 model.compute_buy_addon_credits_banner_display_state(ctx),
                 BuyCreditsBannerDisplayState::OutOfCredits,
             );
+        });
+    });
+}
+
+#[test]
+fn test_ambient_credits_banner_dismissal_is_persisted() {
+    App::test((), |mut app| async move {
+        let request_usage_model = add_request_usage_model(&mut app);
+
+        request_usage_model.update(&mut app, |model, ctx| {
+            assert!(!model.is_ambient_credits_banner_dismissed());
+            model.dismiss_ambient_credits_banner(ctx);
+            assert!(model.is_ambient_credits_banner_dismissed());
+        });
+
+        app.update(|ctx| {
+            let stored_value = ctx
+                .private_user_preferences()
+                .read_value(AMBIENT_CREDITS_BANNER_DISMISSED_KEY)
+                .unwrap();
+            assert_eq!(stored_value, Some("true".to_owned()));
+        });
+    });
+}
+
+#[test]
+fn test_ambient_credits_banner_dismissal_loads_from_preferences() {
+    App::test((), |mut app| async move {
+        register_user_preferences_for_tests(&mut app);
+        app.update(|ctx| {
+            ctx.private_user_preferences()
+                .write_value(AMBIENT_CREDITS_BANNER_DISMISSED_KEY, "true".to_owned())
+                .unwrap();
+        });
+
+        let request_usage_model = add_request_usage_model(&mut app);
+
+        request_usage_model.update(&mut app, |model, _ctx| {
+            assert!(model.is_ambient_credits_banner_dismissed());
         });
     });
 }
@@ -645,7 +709,7 @@ fn test_has_any_ai_remaining_true_with_byok_enabled_and_key_provided() {
         let request_usage_model = add_request_usage_model(&mut app);
 
         ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
-            manager.set_openai_key(Some("test-key".to_string()), ctx);
+            manager.set_provider_key(LLMProvider::OpenAI, Some("test-key".to_string()), ctx);
         });
 
         request_usage_model.update(&mut app, |model, ctx| {
@@ -686,6 +750,74 @@ fn test_has_any_ai_remaining_false_with_byok_enabled_but_no_key() {
 }
 
 #[test]
+fn test_has_any_ai_remaining_true_with_grok_subscription_connected() {
+    App::test((), |mut app| async move {
+        // Workspace with BYO enabled — the policy a connected Grok
+        // subscription's OAuth token rides on.
+        let (_uid, mut workspace) = create_test_workspace();
+        workspace.billing_metadata.tier.byo_api_key_policy =
+            Some(ByoApiKeyPolicy { enabled: true });
+
+        add_user_workspaces_with_workspace(&mut app, workspace);
+        let request_usage_model = add_request_usage_model(&mut app);
+
+        // Connect a Grok subscription but provide no pasted API key.
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_grok_tokens(
+                Some(GrokTokens {
+                    access_token: "grok-test-token".to_string(),
+                    ..Default::default()
+                }),
+                ctx,
+            );
+        });
+
+        request_usage_model.update(&mut app, |model, ctx| {
+            // No standard requests remaining, no bonus credits.
+            model.request_limit_info = RequestLimitInfo::new_for_test(10, 10);
+            model.bonus_grants.clear();
+
+            assert!(
+                model.has_any_ai_remaining(ctx),
+                "expected has_any_ai_remaining to be true when a Grok subscription is connected and BYO is enabled",
+            );
+        });
+    });
+}
+
+#[test]
+fn test_has_any_ai_remaining_false_with_grok_subscription_but_byo_disabled() {
+    App::test((), |mut app| async move {
+        // No BYO policy: the Grok token can't be sent, so it must not count as
+        // available AI.
+        let (_uid, workspace) = create_test_workspace();
+
+        add_user_workspaces_with_workspace(&mut app, workspace);
+        let request_usage_model = add_request_usage_model(&mut app);
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_grok_tokens(
+                Some(GrokTokens {
+                    access_token: "grok-test-token".to_string(),
+                    ..Default::default()
+                }),
+                ctx,
+            );
+        });
+
+        request_usage_model.update(&mut app, |model, ctx| {
+            model.request_limit_info = RequestLimitInfo::new_for_test(10, 10);
+            model.bonus_grants.clear();
+
+            assert!(
+                !model.has_any_ai_remaining(ctx),
+                "expected has_any_ai_remaining to be false when a Grok subscription is connected but BYO is disabled",
+            );
+        });
+    });
+}
+
+#[test]
 fn test_has_any_ai_remaining_true_with_byo_key_and_no_workspace() {
     App::test((), |mut app| async move {
         let _guard = FeatureFlag::SoloUserByok.override_enabled(true);
@@ -695,7 +827,7 @@ fn test_has_any_ai_remaining_true_with_byo_key_and_no_workspace() {
         let request_usage_model = add_request_usage_model(&mut app);
 
         ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
-            manager.set_openai_key(Some("test-key".to_string()), ctx);
+            manager.set_provider_key(LLMProvider::OpenAI, Some("test-key".to_string()), ctx);
         });
 
         request_usage_model.update(&mut app, |model, ctx| {
@@ -720,7 +852,7 @@ fn test_byo_api_key_disabled_for_anonymous_firebase_user() {
         let request_usage_model = add_request_usage_model_for_anonymous_users(&mut app);
 
         ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
-            manager.set_openai_key(Some("test-key".to_string()), ctx);
+            manager.set_provider_key(LLMProvider::OpenAI, Some("test-key".to_string()), ctx);
         });
 
         app.read(|ctx| {
