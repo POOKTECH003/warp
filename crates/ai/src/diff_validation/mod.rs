@@ -324,6 +324,9 @@ fn remove_extra_line_num_prefix(replace: String) -> String {
         .join("\n")
 }
 
+/// Each failed search block is echoed back to the model in the retry message, so cap the
+/// surfaced text: an oversized block would otherwise bloat the context window and crowd out the
+/// other enumerated failures.
 const MAX_DIFF_MATCH_FAILURE_BYTES: usize = 1_000;
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]

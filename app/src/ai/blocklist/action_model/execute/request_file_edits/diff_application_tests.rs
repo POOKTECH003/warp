@@ -914,6 +914,15 @@ fn test_apply_v4a_edits_no_match() {
             }
             other => panic!("Expected a single UnmatchedDiffs error, got {other:?}"),
         }
+
+        // The rendered message should surface the reconstructed search block (pre-context + old +
+        // post-context) and, since V4A hunks carry no line numbers, omit the "Expected line" prefix.
+        let message = DiffApplicationError::error_for_conversation(&errors);
+        assert!(message.contains("Update each failed search block to match the file exactly"));
+        assert!(message.contains(
+            "Non-existent pre context\nNon-existent old content\nNon-existent post context"
+        ));
+        assert!(!message.contains("Expected line"));
     });
 }
 
