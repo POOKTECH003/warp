@@ -12,8 +12,14 @@ use super::{
     MAX_CREDIT_PACKS, OfferChoice, OfferSlide, OfferSlideAction, OfferVariant, OnboardingSlide as _,
 };
 use crate::model::{
-    CreditPackOption, CreditPurchaseState, OnboardingAuthState, OnboardingStateModel,
+    ChooseHowToStartExperimentArm, CreditPackOption, CreditPurchaseState, OnboardingAuthState,
+    OnboardingStateModel,
 };
+
+/// The pre-credit-pack copy the control arm restores, asserted byte-for-byte so
+/// a later copy edit can't silently change what the control measures (REV-1939).
+const CONTROL_PRIMARY_LABEL: &str = "Use Warp with AI";
+const CONTROL_PRIMARY_DESCRIPTION: &str = "Warp Agent works locally or in the cloud with frontier and OSS models. Proactively fix terminal errors, implement changes, and ship verified code.";
 
 /// A do-nothing view used only to observe the events an [`OfferSlide`] emits.
 struct EventObserver {
@@ -39,7 +45,7 @@ impl TypedActionView for EventObserver {
 }
 
 fn add_onboarding_state(app: &mut App) -> ModelHandle<OnboardingStateModel> {
-    app.add_model(|_| {
+    let model = app.add_model(|_| {
         OnboardingStateModel::new(
             Vec::new(),
             LLMId::from("auto"),
@@ -47,7 +53,15 @@ fn add_onboarding_state(app: &mut App) -> ModelHandle<OnboardingStateModel> {
             true,
             OnboardingAuthState::FreeUser,
         )
-    })
+    });
+    // Most offer-slide tests exercise the credit-pack UI, which only renders for
+    // the experiment arm. Default the test state to that arm so those tests see
+    // packs; the arm-gating tests below set Control/Unassigned explicitly.
+    model.update(app, |model, ctx| {
+        model
+            .set_choose_how_to_start_experiment_arm(ChooseHowToStartExperimentArm::Experiment, ctx);
+    });
+    model
 }
 
 fn credit_packs(count: usize) -> Vec<CreditPackOption> {
@@ -129,6 +143,51 @@ fn choose_how_to_start_copy_and_telemetry_names_match_spec() {
     assert_eq!(variant.account_class(), "free_standard");
     assert_eq!(variant.primary_action(), "use_warp_with_ai");
     assert_eq!(variant.credits_action(), "buy_ai_credits");
+}
+
+#[test]
+fn promotion_replaces_recommended_on_both_offer_variants() {
+    let promotion = Some("50% off Fable and Opus 5");
+
+    assert_eq!(
+        OfferVariant::ChooseHowToStart.primary_badge_label(promotion),
+        "50% off Fable and Opus 5"
+    );
+    assert_eq!(
+        OfferVariant::ChooseHowToStart.primary_badge_label(None),
+        "Recommended"
+    );
+    assert_eq!(
+        OfferVariant::HeadStart.primary_badge_label(promotion),
+        "50% off Fable and Opus 5"
+    );
+    assert_eq!(
+        OfferVariant::HeadStart.primary_badge_label(None),
+        "Recommended"
+    );
+}
+
+#[test]
+fn both_rendered_offer_paths_read_the_promotion_from_onboarding_state() {
+    App::test((), |mut app| async move {
+        let onboarding_state = add_onboarding_state(&mut app);
+        onboarding_state.update(&mut app, |model, ctx| {
+            model
+                .set_pricing_promotion_message(Some("50% off Fable 5 and Opus 5".to_string()), ctx);
+        });
+        let slide = OfferSlide::new(onboarding_state);
+
+        app.read(|ctx| {
+            assert_eq!(
+                slide.primary_badge_label(OfferVariant::HeadStart, ctx),
+                "50% off Fable 5 and Opus 5"
+            );
+            assert_eq!(
+                slide.primary_badge_label(OfferVariant::ChooseHowToStart, ctx),
+                "50% off Fable 5 and Opus 5"
+            );
+        });
+    });
 }
 
 /// The subscribe card must frame the add-on discount as a saving (matching the
@@ -661,6 +720,139 @@ fn more_packs_than_the_render_cap_are_truncated() {
                 MAX_CREDIT_PACKS
             );
             drop(slide.render(ctx));
+        });
+    });
+}
+
+/// REV-1939: control and unassigned users get the historical two-option layout
+/// even when purchasable packs are loaded, and the packs stay in the model so
+/// hiding them is an arm decision, not a pricing outcome.
+#[test]
+fn control_and_unassigned_arms_hide_credit_packs() {
+    for arm in [
+        ChooseHowToStartExperimentArm::Control,
+        ChooseHowToStartExperimentArm::Unassigned,
+    ] {
+        App::test((), move |mut app| async move {
+            app.add_singleton_model(|_| Appearance::mock());
+            app.update(MockTelemetryContextProvider::register);
+            let onboarding_state = add_onboarding_state(&mut app);
+            let (_, slide) = app.add_window(WindowStyle::NotStealFocus, {
+                let onboarding_state = onboarding_state.clone();
+                move |_| OfferSlide::new(onboarding_state)
+            });
+            onboarding_state.update(&mut app, |model, ctx| {
+                model.set_choose_how_to_start_experiment_arm(arm, ctx);
+                model.show_post_auth_offer(OfferVariant::ChooseHowToStart, ctx);
+                model.set_credit_pack_options(credit_packs(4), ctx);
+            });
+
+            app.read(|ctx| {
+                let slide = slide.as_ref(ctx);
+                assert_eq!(
+                    slide.choices(OfferVariant::ChooseHowToStart, ctx),
+                    vec![OfferChoice::Primary, OfferChoice::SetUpLater],
+                    "{arm:?} must not offer credit packs"
+                );
+                assert!(
+                    !slide.shows_credit_packs(OfferVariant::ChooseHowToStart, ctx),
+                    "{arm:?} must hide the credit packs"
+                );
+                assert!(
+                    slide
+                        .credit_packs(OfferVariant::ChooseHowToStart, ctx)
+                        .is_empty()
+                );
+                drop(slide.render(ctx));
+            });
+
+            // The packs stay loaded in the model; hiding them is an arm decision.
+            onboarding_state.read(&app, |model, _| {
+                assert_eq!(model.credit_pack_options().len(), 4);
+            });
+
+            // The control renders the exact pre-credit-pack two-option copy.
+            assert_eq!(
+                OfferVariant::ChooseHowToStart.primary_label(),
+                CONTROL_PRIMARY_LABEL
+            );
+            assert_eq!(
+                OfferVariant::ChooseHowToStart.primary_description(false),
+                CONTROL_PRIMARY_DESCRIPTION
+            );
+        });
+    }
+}
+
+/// REV-1939: the experiment arm surfaces the buy-credits option once packs are
+/// available.
+#[test]
+fn experiment_arm_with_packs_offers_buy_credits() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.update(MockTelemetryContextProvider::register);
+        let onboarding_state = add_onboarding_state(&mut app);
+        let (_, slide) = app.add_window(WindowStyle::NotStealFocus, {
+            let onboarding_state = onboarding_state.clone();
+            move |_| OfferSlide::new(onboarding_state)
+        });
+        onboarding_state.update(&mut app, |model, ctx| {
+            model.set_choose_how_to_start_experiment_arm(
+                ChooseHowToStartExperimentArm::Experiment,
+                ctx,
+            );
+            model.show_post_auth_offer(OfferVariant::ChooseHowToStart, ctx);
+            model.set_credit_pack_options(credit_packs(4), ctx);
+        });
+
+        app.read(|ctx| {
+            let slide = slide.as_ref(ctx);
+            assert_eq!(
+                slide.choices(OfferVariant::ChooseHowToStart, ctx),
+                vec![
+                    OfferChoice::Primary,
+                    OfferChoice::BuyCredits,
+                    OfferChoice::SetUpLater
+                ]
+            );
+            assert!(slide.shows_credit_packs(OfferVariant::ChooseHowToStart, ctx));
+            drop(slide.render(ctx));
+        });
+    });
+}
+
+/// REV-1939: an experiment-arm user with no purchasable packs falls back to the
+/// safe two-option layout, and stays telemetry-assigned to `experiment` rather
+/// than being relabelled as control.
+#[test]
+fn experiment_arm_without_packs_falls_back_to_two_options() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.update(MockTelemetryContextProvider::register);
+        let onboarding_state = add_onboarding_state(&mut app);
+        let (_, slide) = app.add_window(WindowStyle::NotStealFocus, {
+            let onboarding_state = onboarding_state.clone();
+            move |_| OfferSlide::new(onboarding_state)
+        });
+        onboarding_state.update(&mut app, |model, ctx| {
+            model.set_choose_how_to_start_experiment_arm(
+                ChooseHowToStartExperimentArm::Experiment,
+                ctx,
+            );
+            model.show_post_auth_offer(OfferVariant::ChooseHowToStart, ctx);
+        });
+
+        app.read(|ctx| {
+            let slide = slide.as_ref(ctx);
+            assert_eq!(
+                slide.choices(OfferVariant::ChooseHowToStart, ctx),
+                vec![OfferChoice::Primary, OfferChoice::SetUpLater]
+            );
+            drop(slide.render(ctx));
+        });
+
+        onboarding_state.read(&app, |model, _| {
+            assert_eq!(model.offer_experiment_arm(), Some("experiment"));
         });
     });
 }
