@@ -58,49 +58,29 @@ impl TryFrom<DirEntry> for EngineDirEntry {
 
     fn try_from(value: DirEntry) -> Result<Self, Self::Error> {
         let file_type = value.file_type()?;
-        safe_debug!(
-            safe: (
-                "[APP-3993 symlink-completion] entry flags: is_dir={} is_file={} is_symlink={}",
-                file_type.is_dir(),
-                file_type.is_file(),
-                file_type.is_symlink()
-            ),
-            full: (
-                "[APP-3993 symlink-completion] entry {:?} flags: is_dir={} is_file={} is_symlink={}",
-                value.file_name(),
-                file_type.is_dir(),
-                file_type.is_file(),
-                file_type.is_symlink()
-            )
-        );
         let is_dir = if file_type.is_dir() {
             true
         } else if file_type.is_symlink() {
             // If the file is a symlink, follow the symlink and check if the target is a directory.
             match value.path().metadata() {
-                Ok(metadata) => {
-                    let target_is_dir = metadata.is_dir();
-                    safe_debug!(
-                        safe: ("[APP-3993 symlink-completion] symlink metadata ok: is_dir={target_is_dir}"),
-                        full: (
-                            "[APP-3993 symlink-completion] symlink {:?} metadata ok: is_dir={target_is_dir}",
-                            value.path()
-                        )
-                    );
-                    target_is_dir
-                }
+                Ok(metadata) => metadata.is_dir(),
                 Err(err) => {
-                    safe_debug!(
-                        safe: (
-                            "[APP-3993 symlink-completion] symlink metadata err: kind={:?}",
-                            err.kind()
-                        ),
-                        full: (
-                            "[APP-3993 symlink-completion] symlink {:?} metadata err: kind={:?} err={err:#}",
-                            value.path(),
-                            err.kind()
-                        )
-                    );
+                    // APP-3993 diagnostic probe (temporary): when following a symlink fails, record
+                    // whether `read_link` can read it, to confirm on a real WSL host that its
+                    // LX symlinks are unresolvable host-side (the app-side guest fallback then
+                    // classifies them). Gated on debug so it costs no extra syscall by default.
+                    if log::log_enabled!(log::Level::Debug) {
+                        match std::fs::read_link(value.path()) {
+                            Ok(target) => safe_debug!(
+                                safe: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link ok", err.kind()),
+                                full: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link ok target={target:?}", err.kind())
+                            ),
+                            Err(link_err) => safe_debug!(
+                                safe: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link err kind={:?}", err.kind(), link_err.kind()),
+                                full: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link err kind={:?}", err.kind(), link_err.kind())
+                            ),
+                        }
+                    }
                     false
                 }
             }

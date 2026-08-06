@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,12 +19,13 @@ use warp_completer::completer::{
 use warp_completer::signatures::CommandRegistry;
 use warp_core::features::FeatureFlag;
 use warp_util::path::{EscapeChar, ShellFamily};
+use warpui::r#async::FutureExt as AsyncFutureExt;
 use warpui::{AppContext, SingletonEntity};
 
+use crate::safe_warn;
 use crate::terminal::model::session::{ExecuteCommandOptions, Session, SessionType};
 use crate::util::AsciiDebug;
 use crate::workflows::aliases::WorkflowAliases;
-use crate::{safe_debug, safe_warn};
 
 lazy_static! {
     pub static ref CURR_DIRECTORY_ENTRY: EngineDirEntry = EngineDirEntry {
@@ -75,9 +77,6 @@ impl SessionContext {
     ) -> Vec<EngineDirEntry> {
         match self.session.session_type() {
             SessionType::Local => {
-                log::debug!(
-                    "[APP-3993 symlink-completion] list_directory_entries_internal branch=Local"
-                );
                 let dir = match self.session.maybe_convert_to_native_path(directory) {
                     Ok(dir) => dir,
                     Err(err) => {
@@ -85,13 +84,6 @@ impl SessionContext {
                         return Vec::new();
                     }
                 };
-                safe_debug!(
-                    safe: ("[APP-3993 symlink-completion] converted listed directory to native host path (Local session)"),
-                    full: (
-                        "[APP-3993 symlink-completion] converted listed directory (Local session): guest={directory:?} host={}",
-                        dir.display()
-                    )
-                );
                 // We intentionally use the synchronous `std::fs::read_dir`,
                 // despite this being an async function, because the overhead
                 // of switching threads is very expensive relative to the
@@ -103,34 +95,43 @@ impl SessionContext {
                 // It's possible that it would be better to use
                 // `async_fs::read_dir` if the directory is on a network mount,
                 // but I don't think it's worth optimizing for that case.
-                let read_dir = match std::fs::read_dir(dir.as_path()) {
-                    Ok(read_dir) => read_dir,
-                    Err(err) => {
-                        safe_debug!(
-                            safe: ("[APP-3993 symlink-completion] read_dir failed: kind={:?}", err.kind()),
-                            full: (
-                                "[APP-3993 symlink-completion] read_dir failed for {:?}: kind={:?} err={err:#}",
-                                dir.display(),
-                                err.kind()
-                            )
-                        );
-                        return vec![];
-                    }
+                let Some(read_dir) = std::fs::read_dir(dir.as_path()).ok() else {
+                    return vec![];
                 };
 
-                let entries = read_dir
-                    .filter_map(|res| res.and_then(EngineDirEntry::try_from).ok())
-                    .collect::<Vec<_>>();
-                log::debug!(
-                    "[APP-3993 symlink-completion] listed local directory: entry_count={}",
-                    entries.len()
-                );
+                let mut entries = Vec::new();
+                // Symlinks the host classified as non-directories. In an emulated session (WSL,
+                // MSYS2) the host cannot follow a symlink whose target lives in the guest path
+                // space, so a directory symlink arrives here as a file; the guest resolves these.
+                let mut unresolved_symlinks: HashSet<String> = HashSet::new();
+                for entry in read_dir.filter_map(|res| res.ok()) {
+                    let is_symlink = entry
+                        .file_type()
+                        .map(|file_type| file_type.is_symlink())
+                        .unwrap_or(false);
+                    let Ok(engine_entry) = EngineDirEntry::try_from(entry) else {
+                        continue;
+                    };
+                    if is_symlink && !engine_entry.is_dir() {
+                        unresolved_symlinks.insert(engine_entry.file_name().to_owned());
+                    }
+                    entries.push(engine_entry);
+                }
+
+                if !unresolved_symlinks.is_empty()
+                    && (self.session.is_wsl() || self.session.is_msys2())
+                    && let Some(guest_dirs) = self.guest_directory_names(directory).await
+                {
+                    upgrade_guest_directory_symlinks(
+                        &mut entries,
+                        &unresolved_symlinks,
+                        &guest_dirs,
+                    );
+                }
+
                 entries
             }
             SessionType::WarpifiedRemote { .. } => {
-                log::debug!(
-                    "[APP-3993 symlink-completion] list_directory_entries_internal branch=WarpifiedRemote"
-                );
                 let env_vars = self
                     .session
                     .path()
@@ -215,6 +216,39 @@ impl SessionContext {
                     );
                     vec![]
                 }
+            }
+        }
+    }
+
+    /// Asks the guest (WSL/MSYS2) which immediate children of `directory` are directories, so a
+    /// directory symlink the host could not follow can be reclassified. Returns `None` on any
+    /// failure or timeout, so completion degrades to the host classification rather than stalling
+    /// on a slow guest.
+    async fn guest_directory_names(&self, directory: &TypedPath<'_>) -> Option<HashSet<String>> {
+        let script = find_dirs_script_for_dir(directory)?;
+        let env_vars = self
+            .session
+            .path()
+            .as_deref()
+            .map(|path| HashMap::from_iter([("PATH".to_string(), path.to_string())]));
+        let result = self
+            .session
+            .execute_command(&script, None, env_vars, ExecuteCommandOptions::default())
+            .with_timeout(GUEST_SYMLINK_CLASSIFY_TIMEOUT)
+            .await;
+        match result {
+            Ok(Ok(output)) if output.status == CommandExitStatus::Success => output
+                .to_string()
+                .ok()
+                .map(|s| parse_guest_directory_names(&s)),
+            Ok(Ok(_)) => None,
+            Ok(Err(err)) => {
+                log::warn!("Guest directory classification command failed: {err:#}");
+                None
+            }
+            Err(_timed_out) => {
+                log::warn!("Guest directory classification command timed out");
+                None
             }
         }
     }
@@ -531,6 +565,47 @@ find -L . -maxdepth 1 -not -type d -print0
     .replace("\n", " ");
 
     Some(command)
+}
+
+/// Bounds the guest directory-classification command so a slow or hung guest degrades to the host
+/// classification instead of stalling completion.
+const GUEST_SYMLINK_CLASSIFY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Builds a script listing the immediate subdirectories of `directory` in the guest, following
+/// symlinks (`-L`) so a directory symlink the host cannot resolve is reported. Nothing from the
+/// listing is interpolated into the command, so there is no filename-quoting or injection surface.
+fn find_dirs_script_for_dir(directory: &TypedPath) -> Option<String> {
+    let dir_str = directory.to_str()?;
+    let escaped_dir = ShellFamily::Posix.shell_escape(dir_str);
+    Some(format!("cd {escaped_dir} && find -L . -maxdepth 1 -type d -print0").replace('\n', " "))
+}
+
+/// Parses the null-separated output of `find -L . -maxdepth 1 -type d -print0` into the set of
+/// immediate subdirectory names, dropping the listed directory itself (emitted as ".").
+fn parse_guest_directory_names(output: &str) -> HashSet<String> {
+    output
+        .split('\0')
+        .filter(|entry| !entry.is_empty() && *entry != ".")
+        .filter_map(|entry| Path::new(entry).file_name().and_then(|name| name.to_str()))
+        .map(|name| name.to_owned())
+        .collect()
+}
+
+/// Reclassifies as directories the unresolved symlink entries that the guest reports as
+/// directories, leaving every other entry as the host classified it.
+fn upgrade_guest_directory_symlinks(
+    entries: &mut [EngineDirEntry],
+    unresolved_symlinks: &HashSet<String>,
+    guest_dirs: &HashSet<String>,
+) {
+    for entry in entries.iter_mut() {
+        if !entry.is_dir()
+            && unresolved_symlinks.contains(entry.file_name())
+            && guest_dirs.contains(entry.file_name())
+        {
+            entry.file_type = EngineFileType::Directory;
+        }
+    }
 }
 
 #[cfg(test)]
