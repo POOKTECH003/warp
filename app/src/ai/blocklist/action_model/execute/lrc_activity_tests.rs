@@ -426,6 +426,83 @@ fn remote_sessions_report_only_the_terminal_tier() {
     assert!(report.output_changed_since_last_read);
 }
 
+/// The server reads a missing submessage and an all-zero one differently, so a
+/// quiet-but-inspected process tree must still produce a present submessage.
+#[test]
+fn a_fully_quiet_process_tree_is_still_reported() {
+    let start = Instant::now();
+    let mut activity = local_activity(start);
+
+    // Inspected repeatedly, and every reading is zero: no CPU, no I/O, and a
+    // single sleeping process.
+    for second in 1..=5 {
+        activity.apply_sample(
+            sample(
+                OUTPUT_A,
+                Some(ProcessSample {
+                    per_pid: vec![PidSample {
+                        pid: Pid::from_u32(100),
+                        cpu_ms: 0,
+                        io_write_bytes: 0,
+                    }],
+                    state: LrcProcessState::Sleeping,
+                }),
+            ),
+            start + Duration::from_secs(second),
+        );
+    }
+
+    let report = activity.take_report(start + Duration::from_secs(5), no_tail);
+    let process = report
+        .process
+        .expect("an all-zero reading is still a reading");
+    assert_eq!(process.cpu_time_delta, Duration::ZERO);
+    assert_eq!(process.io_write_bytes_delta, 0);
+    assert_eq!(process.live_process_count, 1);
+    assert_eq!(process.state, LrcProcessState::Sleeping);
+    assert!(!report.signals_unavailable);
+}
+
+/// A command is registered when its first snapshot is built, before the sampler
+/// has run for it. Reporting the still-zero counters then would describe a
+/// healthy command as a process tree with nothing running.
+#[test]
+fn the_process_tier_is_withheld_until_it_has_actually_been_sampled() {
+    let start = Instant::now();
+    let mut activity = local_activity(start);
+
+    let first = activity.take_report(start, no_tail);
+    assert!(first.process.is_none());
+    assert!(first.signals_unavailable);
+
+    activity.apply_sample(
+        sample(OUTPUT_A, Some(process_sample(&[(100, 1_000)]))),
+        start + Duration::from_secs(1),
+    );
+
+    let second = activity.take_report(start + Duration::from_secs(1), no_tail);
+    assert!(second.process.is_some());
+    assert!(!second.signals_unavailable);
+}
+
+/// Zero growth is a real observation about a tracked file, not an absence of
+/// one, so it must survive to the wire rather than being filtered out.
+#[test]
+fn a_tracked_file_that_has_not_grown_is_still_reported() {
+    let start = Instant::now();
+    let mut activity = activity_with_files(&["/tmp/build.log"], &[Some(4_096)], start);
+
+    activity.apply_sample(
+        file_sample(OUTPUT_A, vec![Some(4_096)]),
+        start + Duration::from_secs(1),
+    );
+
+    let report = activity.take_report(start + Duration::from_secs(1), no_tail);
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.files[0].size_bytes, 4_096);
+    assert_eq!(report.files[0].size_delta_bytes, 0);
+}
+
 #[test]
 fn aggregate_state_prefers_the_strongest_evidence_of_progress() {
     assert_eq!(

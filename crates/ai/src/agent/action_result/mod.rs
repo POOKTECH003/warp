@@ -211,13 +211,22 @@ pub struct LrcActivity {
     /// Time since the terminal output grid last changed.
     pub since_output_change: Option<Duration>,
 
+    /// Present whenever the process tree was actually inspected, including when
+    /// every reading in it is zero: an exited tree is a real answer. Absent only
+    /// when no reading was taken, which is always accompanied by
+    /// [`Self::signals_unavailable`].
     pub process: Option<LrcProcessActivity>,
 
+    /// One entry per identified write target that exists, including targets that
+    /// have not grown since the previous snapshot. Empty when the command has no
+    /// identifiable write targets.
     pub files: Vec<LrcFileActivity>,
 
-    /// Set when the process and file tiers could not be collected at all (e.g. a
-    /// remote session). Distinguishes "we looked and found nothing" from "we
-    /// could not look", which the agent must not read as evidence of a hang.
+    /// Set when the process tier could not be collected: a remote session, whose
+    /// processes live on another host, or a first snapshot built before the
+    /// sampler has had a chance to look. Distinguishes "we looked and found
+    /// nothing" from "we could not look", which the agent must not read as
+    /// evidence of a hang.
     pub signals_unavailable: bool,
 }
 

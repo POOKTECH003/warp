@@ -100,6 +100,13 @@ struct ProcessTier {
     io_write_bytes_since_report: u64,
     state: LrcProcessState,
     live_process_count: u32,
+    /// Whether the sampler has ever actually observed the process tree.
+    ///
+    /// A command is registered on its first snapshot, which is built before the
+    /// sampler has had a chance to look at it. Until it has, every counter here
+    /// is still zero, and zero is indistinguishable from a process tree with
+    /// nothing left running.
+    sampled: bool,
 }
 
 struct FileTier {
@@ -392,6 +399,7 @@ impl BlockActivity {
             self.process.io_write_bytes_since_report += io_delta;
             self.process.state = process.state;
             self.process.live_process_count = process.per_pid.len() as u32;
+            self.process.sampled = true;
 
             // Process churn is itself progress: a build spawning and reaping
             // compilers may never accumulate much CPU in any single process.
@@ -416,7 +424,11 @@ impl BlockActivity {
     /// `read_tail` is injected so the (comparatively expensive) file read and
     /// secret-redaction pass happens only here, never on the sampling path.
     fn take_report(&mut self, now: Instant, read_tail: impl Fn(&Path) -> String) -> LrcActivity {
-        let process = self.signals_available.then(|| LrcProcessActivity {
+        // An all-zero process tier is a meaningful reading — an exited tree —
+        // so it is reported rather than suppressed. It is only withheld when no
+        // reading was taken at all, which must not be mistaken for one.
+        let process_collected = self.signals_available && self.process.sampled;
+        let process = process_collected.then(|| LrcProcessActivity {
             cpu_time_delta: Duration::from_millis(self.process.cpu_ms_since_report),
             state: self.process.state,
             live_process_count: self.process.live_process_count,
@@ -445,7 +457,7 @@ impl BlockActivity {
             since_output_change: Some(now.saturating_duration_since(self.output.last_change)),
             process,
             files,
-            signals_unavailable: !self.signals_available,
+            signals_unavailable: !process_collected,
         };
 
         self.output.changed_since_report = false;
