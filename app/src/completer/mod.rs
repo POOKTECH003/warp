@@ -20,10 +20,10 @@ use warp_core::features::FeatureFlag;
 use warp_util::path::{EscapeChar, ShellFamily};
 use warpui::{AppContext, SingletonEntity};
 
-use crate::safe_warn;
 use crate::terminal::model::session::{ExecuteCommandOptions, Session, SessionType};
 use crate::util::AsciiDebug;
 use crate::workflows::aliases::WorkflowAliases;
+use crate::{safe_debug, safe_warn};
 
 lazy_static! {
     pub static ref CURR_DIRECTORY_ENTRY: EngineDirEntry = EngineDirEntry {
@@ -75,6 +75,9 @@ impl SessionContext {
     ) -> Vec<EngineDirEntry> {
         match self.session.session_type() {
             SessionType::Local => {
+                log::debug!(
+                    "[APP-3993 symlink-completion] list_directory_entries_internal branch=Local"
+                );
                 let dir = match self.session.maybe_convert_to_native_path(directory) {
                     Ok(dir) => dir,
                     Err(err) => {
@@ -82,6 +85,13 @@ impl SessionContext {
                         return Vec::new();
                     }
                 };
+                safe_debug!(
+                    safe: ("[APP-3993 symlink-completion] converted listed directory to native host path (Local session)"),
+                    full: (
+                        "[APP-3993 symlink-completion] converted listed directory (Local session): guest={directory:?} host={}",
+                        dir.display()
+                    )
+                );
                 // We intentionally use the synchronous `std::fs::read_dir`,
                 // despite this being an async function, because the overhead
                 // of switching threads is very expensive relative to the
@@ -93,15 +103,34 @@ impl SessionContext {
                 // It's possible that it would be better to use
                 // `async_fs::read_dir` if the directory is on a network mount,
                 // but I don't think it's worth optimizing for that case.
-                let Some(read_dir) = std::fs::read_dir(dir.as_path()).ok() else {
-                    return vec![];
+                let read_dir = match std::fs::read_dir(dir.as_path()) {
+                    Ok(read_dir) => read_dir,
+                    Err(err) => {
+                        safe_debug!(
+                            safe: ("[APP-3993 symlink-completion] read_dir failed: kind={:?}", err.kind()),
+                            full: (
+                                "[APP-3993 symlink-completion] read_dir failed for {:?}: kind={:?} err={err:#}",
+                                dir.display(),
+                                err.kind()
+                            )
+                        );
+                        return vec![];
+                    }
                 };
 
-                read_dir
+                let entries = read_dir
                     .filter_map(|res| res.and_then(EngineDirEntry::try_from).ok())
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                log::debug!(
+                    "[APP-3993 symlink-completion] listed local directory: entry_count={}",
+                    entries.len()
+                );
+                entries
             }
             SessionType::WarpifiedRemote { .. } => {
+                log::debug!(
+                    "[APP-3993 symlink-completion] list_directory_entries_internal branch=WarpifiedRemote"
+                );
                 let env_vars = self
                     .session
                     .path()

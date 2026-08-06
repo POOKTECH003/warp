@@ -9,6 +9,7 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use typed_path::{TypedPath, TypedPathBuf};
 use warp_command_signatures::{IconType, PathSuggestionType};
+use warp_core::safe_debug;
 use warp_util::path::{HOME_DIR_ENV_VAR_PREFIX, ShellFamily};
 
 use crate::completer::context::{PathCompletionContext, PathSeparators};
@@ -57,15 +58,52 @@ impl TryFrom<DirEntry> for EngineDirEntry {
 
     fn try_from(value: DirEntry) -> Result<Self, Self::Error> {
         let file_type = value.file_type()?;
+        safe_debug!(
+            safe: (
+                "[APP-3993 symlink-completion] entry flags: is_dir={} is_file={} is_symlink={}",
+                file_type.is_dir(),
+                file_type.is_file(),
+                file_type.is_symlink()
+            ),
+            full: (
+                "[APP-3993 symlink-completion] entry {:?} flags: is_dir={} is_file={} is_symlink={}",
+                value.file_name(),
+                file_type.is_dir(),
+                file_type.is_file(),
+                file_type.is_symlink()
+            )
+        );
         let is_dir = if file_type.is_dir() {
             true
         } else if file_type.is_symlink() {
             // If the file is a symlink, follow the symlink and check if the target is a directory.
-            value
-                .path()
-                .metadata()
-                .map(|metadata| metadata.is_dir())
-                .unwrap_or(false)
+            match value.path().metadata() {
+                Ok(metadata) => {
+                    let target_is_dir = metadata.is_dir();
+                    safe_debug!(
+                        safe: ("[APP-3993 symlink-completion] symlink metadata ok: is_dir={target_is_dir}"),
+                        full: (
+                            "[APP-3993 symlink-completion] symlink {:?} metadata ok: is_dir={target_is_dir}",
+                            value.path()
+                        )
+                    );
+                    target_is_dir
+                }
+                Err(err) => {
+                    safe_debug!(
+                        safe: (
+                            "[APP-3993 symlink-completion] symlink metadata err: kind={:?}",
+                            err.kind()
+                        ),
+                        full: (
+                            "[APP-3993 symlink-completion] symlink {:?} metadata err: kind={:?} err={err:#}",
+                            value.path(),
+                            err.kind()
+                        )
+                    );
+                    false
+                }
+            }
         } else {
             false
         };
