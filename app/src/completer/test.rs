@@ -475,8 +475,6 @@ pub fn test_session_context_refresh_directory_entries_bypasses_cache() {
     });
 }
 
-/// APP-3993: the null-separated `find -L . -maxdepth 1 -type d -print0` output parses to the set
-/// of immediate subdirectory names, dropping the listed directory itself (emitted as ".").
 #[test]
 fn test_parse_guest_directory_names() {
     let names = super::parse_guest_directory_names("./realdir\0.\0./link_to_dir\0");
@@ -487,9 +485,6 @@ fn test_parse_guest_directory_names() {
     assert!(super::parse_guest_directory_names("").is_empty());
 }
 
-/// APP-3993 regression for the Err-from-`metadata` path: a symlink the host classified as a file
-/// (its target could not be followed on the host) is reclassified as a directory when the guest
-/// reports it a directory, while every other entry is left as the host classified it.
 #[test]
 fn test_upgrade_guest_directory_symlinks() {
     let mut entries = vec![
@@ -500,7 +495,6 @@ fn test_upgrade_guest_directory_symlinks() {
     ];
     let unresolved_symlinks =
         HashSet::from_iter(["link_to_dir".to_owned(), "link_to_file".to_owned()]);
-    // The guest reports link_to_dir, real_dir, and not_a_symlink as directories.
     let guest_dirs = HashSet::from_iter([
         "link_to_dir".to_owned(),
         "real_dir".to_owned(),
@@ -513,12 +507,8 @@ fn test_upgrade_guest_directory_symlinks() {
         .iter()
         .map(|entry| (entry.file_name(), entry))
         .collect();
-    // The unresolved symlink whose guest target is a directory is upgraded.
     assert!(by_name["link_to_dir"].is_dir());
-    // A symlink whose guest target is not a directory stays a file.
     assert!(!by_name["link_to_file"].is_dir());
-    // A non-symlink entry is never upgraded, even if the guest lists it as a directory.
     assert!(!by_name["not_a_symlink"].is_dir());
-    // An entry already classified as a directory is unaffected.
     assert!(by_name["real_dir"].is_dir());
 }

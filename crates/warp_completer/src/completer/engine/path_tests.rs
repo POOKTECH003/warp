@@ -689,8 +689,6 @@ pub fn test_sorted_cd_directories_pwd_at_dot_in_middle() {
     assert_eq!(displays, vec!["from-a/", "from-pwd/", "from-b/"]);
 }
 
-/// APP-3993: the diagnostic instrumentation added to `try_from` must not change classification —
-/// a local symlink to a directory still resolves to `Directory` and a symlink to a file to `File`.
 #[cfg(unix)]
 #[test]
 fn test_engine_dir_entry_classifies_symlink_targets() {

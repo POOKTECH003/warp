@@ -100,9 +100,8 @@ impl SessionContext {
                 };
 
                 let mut entries = Vec::new();
-                // Symlinks the host classified as non-directories. In an emulated session (WSL,
-                // MSYS2) the host cannot follow a symlink whose target lives in the guest path
-                // space, so a directory symlink arrives here as a file; the guest resolves these.
+                // In an emulated session (WSL, MSYS2) the host cannot follow a symlink whose target
+                // lives in the guest path space, so a directory symlink arrives here as a file.
                 let mut unresolved_symlinks: HashSet<String> = HashSet::new();
                 for entry in read_dir.filter_map(|res| res.ok()) {
                     let is_symlink = entry

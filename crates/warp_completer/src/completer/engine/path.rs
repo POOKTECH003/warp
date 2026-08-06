@@ -9,7 +9,6 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use typed_path::{TypedPath, TypedPathBuf};
 use warp_command_signatures::{IconType, PathSuggestionType};
-use warp_core::safe_debug;
 use warp_util::path::{HOME_DIR_ENV_VAR_PREFIX, ShellFamily};
 
 use crate::completer::context::{PathCompletionContext, PathSeparators};
@@ -62,28 +61,12 @@ impl TryFrom<DirEntry> for EngineDirEntry {
             true
         } else if file_type.is_symlink() {
             // If the file is a symlink, follow the symlink and check if the target is a directory.
-            match value.path().metadata() {
-                Ok(metadata) => metadata.is_dir(),
-                Err(err) => {
-                    // APP-3993 diagnostic probe (temporary): when following a symlink fails, record
-                    // whether `read_link` can read it, to confirm on a real WSL host that its
-                    // LX symlinks are unresolvable host-side (the app-side guest fallback then
-                    // classifies them). Gated on debug so it costs no extra syscall by default.
-                    if log::log_enabled!(log::Level::Debug) {
-                        match std::fs::read_link(value.path()) {
-                            Ok(target) => safe_debug!(
-                                safe: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link ok", err.kind()),
-                                full: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link ok target={target:?}", err.kind())
-                            ),
-                            Err(link_err) => safe_debug!(
-                                safe: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link err kind={:?}", err.kind(), link_err.kind()),
-                                full: ("[APP-3993 symlink-completion] metadata err kind={:?}; read_link err kind={:?}", err.kind(), link_err.kind())
-                            ),
-                        }
-                    }
-                    false
-                }
+            let followed = value.path().metadata().map(|metadata| metadata.is_dir());
+            #[cfg(windows)]
+            if log::log_enabled!(log::Level::Debug) {
+                log_symlink_probe(&value.path(), &file_type, followed.as_ref().err());
             }
+            followed.unwrap_or(false)
         } else {
             false
         };
@@ -96,6 +79,46 @@ impl TryFrom<DirEntry> for EngineDirEntry {
             file_name: value.file_name().to_string_lossy().to_string(),
             file_type,
         })
+    }
+}
+
+/// Records how the host sees a symlink, so a WSL run can settle whether `FILE_ATTRIBUTE_DIRECTORY`
+/// is set on an `IO_REPARSE_TAG_LX_SYMLINK`. If it is, such a link can be classified from its own
+/// attributes, which `metadata` cannot do because it resolves the target across the guest
+/// boundary. The raw bits come from both the directory enumeration and an `lstat` of the link,
+/// since a redirector may fill the two differently. Temporary APP-3993 diagnostic.
+#[cfg(windows)]
+fn log_symlink_probe(
+    path: &std::path::Path,
+    file_type: &std::fs::FileType,
+    metadata_err: Option<&std::io::Error>,
+) {
+    use std::os::windows::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = io_outcome(metadata_err);
+    let read_link = io_outcome(std::fs::read_link(path).as_ref().err());
+    let entry_symlink_dir = file_type.is_symlink_dir();
+    let entry_symlink_file = file_type.is_symlink_file();
+    let link = match std::fs::symlink_metadata(path) {
+        Ok(link) => format!(
+            "link_symlink_dir={} link_symlink_file={} link_attributes={:#010x}",
+            link.file_type().is_symlink_dir(),
+            link.file_type().is_symlink_file(),
+            link.file_attributes()
+        ),
+        Err(err) => format!("link=Err({:?})", err.kind()),
+    };
+    warp_core::safe_debug!(
+        safe: ("[APP-3993 symlink-completion] metadata={metadata} read_link={read_link} entry_symlink_dir={entry_symlink_dir} entry_symlink_file={entry_symlink_file} {link}"),
+        full: ("[APP-3993 symlink-completion] path={} metadata={metadata} read_link={read_link} entry_symlink_dir={entry_symlink_dir} entry_symlink_file={entry_symlink_file} {link}", path.display())
+    );
+}
+
+#[cfg(windows)]
+fn io_outcome(err: Option<&std::io::Error>) -> String {
+    match err {
+        Some(err) => format!("Err({:?})", err.kind()),
+        None => "Ok".to_owned(),
     }
 }
 
