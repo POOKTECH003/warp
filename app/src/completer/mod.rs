@@ -1,11 +1,12 @@
 #[cfg(feature = "completions_v2")]
 mod js;
+#[cfg(windows)]
+mod wsl_symlinks;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -19,7 +20,6 @@ use warp_completer::completer::{
 use warp_completer::signatures::CommandRegistry;
 use warp_core::features::FeatureFlag;
 use warp_util::path::{EscapeChar, ShellFamily};
-use warpui::r#async::FutureExt as AsyncFutureExt;
 use warpui::{AppContext, SingletonEntity};
 
 use crate::safe_warn;
@@ -99,36 +99,15 @@ impl SessionContext {
                     return vec![];
                 };
 
-                let mut entries = Vec::new();
-                // In an emulated session (WSL, MSYS2) the host cannot follow a symlink whose target
-                // lives in the guest path space, so a directory symlink arrives here as a file.
-                let mut unresolved_symlinks: HashSet<String> = HashSet::new();
-                for entry in read_dir.filter_map(|res| res.ok()) {
-                    let is_symlink = entry
-                        .file_type()
-                        .map(|file_type| file_type.is_symlink())
-                        .unwrap_or(false);
-                    let Ok(engine_entry) = EngineDirEntry::try_from(entry) else {
-                        continue;
-                    };
-                    if is_symlink && !engine_entry.is_dir() {
-                        unresolved_symlinks.insert(engine_entry.file_name().to_owned());
+                cfg_if::cfg_if! {
+                    if #[cfg(windows)] {
+                        wsl_symlinks::list_entries(self, directory, read_dir).await
+                    } else {
+                        read_dir
+                            .filter_map(|res| res.and_then(EngineDirEntry::try_from).ok())
+                            .collect::<Vec<_>>()
                     }
-                    entries.push(engine_entry);
                 }
-
-                if !unresolved_symlinks.is_empty()
-                    && (self.session.is_wsl() || self.session.is_msys2())
-                    && let Some(guest_dirs) = self.guest_directory_names(directory).await
-                {
-                    upgrade_guest_directory_symlinks(
-                        &mut entries,
-                        &unresolved_symlinks,
-                        &guest_dirs,
-                    );
-                }
-
-                entries
             }
             SessionType::WarpifiedRemote { .. } => {
                 let env_vars = self
@@ -215,39 +194,6 @@ impl SessionContext {
                     );
                     vec![]
                 }
-            }
-        }
-    }
-
-    /// Asks the guest (WSL/MSYS2) which immediate children of `directory` are directories, so a
-    /// directory symlink the host could not follow can be reclassified. Returns `None` on any
-    /// failure or timeout, so completion degrades to the host classification rather than stalling
-    /// on a slow guest.
-    async fn guest_directory_names(&self, directory: &TypedPath<'_>) -> Option<HashSet<String>> {
-        let script = find_dirs_script_for_dir(directory)?;
-        let env_vars = self
-            .session
-            .path()
-            .as_deref()
-            .map(|path| HashMap::from_iter([("PATH".to_string(), path.to_string())]));
-        let result = self
-            .session
-            .execute_command(&script, None, env_vars, ExecuteCommandOptions::default())
-            .with_timeout(GUEST_SYMLINK_CLASSIFY_TIMEOUT)
-            .await;
-        match result {
-            Ok(Ok(output)) if output.status == CommandExitStatus::Success => output
-                .to_string()
-                .ok()
-                .map(|s| parse_guest_directory_names(&s)),
-            Ok(Ok(_)) => None,
-            Ok(Err(err)) => {
-                log::warn!("Guest directory classification command failed: {err:#}");
-                None
-            }
-            Err(_timed_out) => {
-                log::warn!("Guest directory classification command timed out");
-                None
             }
         }
     }
@@ -564,47 +510,6 @@ find -L . -maxdepth 1 -not -type d -print0
     .replace("\n", " ");
 
     Some(command)
-}
-
-/// Bounds the guest directory-classification command so a slow or hung guest degrades to the host
-/// classification instead of stalling completion.
-const GUEST_SYMLINK_CLASSIFY_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Builds a script listing the immediate subdirectories of `directory` in the guest, following
-/// symlinks (`-L`) so a directory symlink the host cannot resolve is reported. Nothing from the
-/// listing is interpolated into the command, so there is no filename-quoting or injection surface.
-fn find_dirs_script_for_dir(directory: &TypedPath) -> Option<String> {
-    let dir_str = directory.to_str()?;
-    let escaped_dir = ShellFamily::Posix.shell_escape(dir_str);
-    Some(format!("cd {escaped_dir} && find -L . -maxdepth 1 -type d -print0").replace('\n', " "))
-}
-
-/// Parses the null-separated output of `find -L . -maxdepth 1 -type d -print0` into the set of
-/// immediate subdirectory names, dropping the listed directory itself (emitted as ".").
-fn parse_guest_directory_names(output: &str) -> HashSet<String> {
-    output
-        .split('\0')
-        .filter(|entry| !entry.is_empty() && *entry != ".")
-        .filter_map(|entry| Path::new(entry).file_name().and_then(|name| name.to_str()))
-        .map(|name| name.to_owned())
-        .collect()
-}
-
-/// Reclassifies as directories the unresolved symlink entries that the guest reports as
-/// directories, leaving every other entry as the host classified it.
-fn upgrade_guest_directory_symlinks(
-    entries: &mut [EngineDirEntry],
-    unresolved_symlinks: &HashSet<String>,
-    guest_dirs: &HashSet<String>,
-) {
-    for entry in entries.iter_mut() {
-        if !entry.is_dir()
-            && unresolved_symlinks.contains(entry.file_name())
-            && guest_dirs.contains(entry.file_name())
-        {
-            entry.file_type = EngineFileType::Directory;
-        }
-    }
 }
 
 #[cfg(test)]

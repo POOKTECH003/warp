@@ -82,11 +82,8 @@ impl TryFrom<DirEntry> for EngineDirEntry {
     }
 }
 
-/// Records how the host sees a symlink, so a WSL run can settle whether `FILE_ATTRIBUTE_DIRECTORY`
-/// is set on an `IO_REPARSE_TAG_LX_SYMLINK`. If it is, such a link can be classified from its own
-/// attributes, which `metadata` cannot do because it resolves the target across the guest
-/// boundary. The raw bits come from both the directory enumeration and an `lstat` of the link,
-/// since a redirector may fill the two differently. Temporary APP-3993 diagnostic.
+/// Temporary probe for whether `FILE_ATTRIBUTE_DIRECTORY` is set on a WSL reparse point, which
+/// would allow classifying such a link without resolving its target across the guest boundary.
 #[cfg(windows)]
 fn log_symlink_probe(
     path: &std::path::Path,
