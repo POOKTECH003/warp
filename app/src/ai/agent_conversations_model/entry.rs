@@ -17,6 +17,7 @@ use crate::ai::ambient_agents::{
 };
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::history_model::{AIConversationMetadata, BlocklistAIHistoryModel};
+use crate::ai::blocklist::orchestration_topology::orchestration_aware_conversation_status;
 use crate::ai::conversation_navigation::ConversationNavigationData;
 use crate::auth::{AuthStateProvider, UserUid};
 use crate::util::time_format::human_readable_precise_duration;
@@ -388,7 +389,13 @@ fn conversation_display_status(
 ) -> AgentRunDisplayStatus {
     history_model
         .conversation(&metadata.nav_data.id)
-        .map(|conversation| AgentRunDisplayStatus::from_conversation_status(conversation.status()))
+        .map(|conversation| {
+            // Roll the whole orchestration subtree (children, grandchildren,
+            // …) into the card's status.
+            AgentRunDisplayStatus::from_conversation_status(
+                &orchestration_aware_conversation_status(history_model, conversation),
+            )
+        })
         .unwrap_or(AgentRunDisplayStatus::ConversationSucceeded)
 }
 

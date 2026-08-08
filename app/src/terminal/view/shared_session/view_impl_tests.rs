@@ -36,6 +36,7 @@ use crate::server::ids::ServerId;
 use crate::server::server_api::ai::SpawnAgentRequest;
 use crate::terminal::TerminalView;
 use crate::terminal::model::blocks::{INLINE_BANNER_HEIGHT, ToTotalIndex as _};
+use crate::terminal::model::terminal_model::ConversationTranscriptViewerStatus;
 use crate::terminal::view::shared_session::test_utils::terminal_view_for_viewer;
 use crate::terminal::view::{AIQueryRouting, TerminalAction, resolve_ai_query_routing};
 use crate::test_util::add_window_with_terminal;
@@ -2564,6 +2565,134 @@ fn test_session_sharing_context_menu_copy_link_enabled_when_session_link_availab
             assert!(
                 !copy_link_item.unwrap().fields().unwrap().is_disabled(),
                 "Copy session sharing link must be enabled when session link is available"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_gate_shows_for_ambient_task() {
+    // REMOTE-2346: the workspace-level transcript details panel is gated on
+    // `Workspace::should_show_conversation_details_panel`. It is gated on
+    // `cfg(any(test, target_arch = "wasm32"))`, so it can be exercised on the host target even
+    // though the WASM render path itself is compiled out.
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+        let task = create_cloud_mode_task_for_user(TEST_USER_UID);
+        configure_ambient_details_panel_test(&mut app, &terminal, task);
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.should_show_wasm_conversation_details_panel(ctx),
+                "WASM details button gate must return true when an ambient cloud task is wired"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_gate_hidden_for_plain_terminal() {
+    // REMOTE-2346: `should_show_wasm_conversation_details_panel` must return false for a
+    // terminal with no ambient task, no transcript viewer, and no active conversation, so
+    // the pane-header button does not appear when the workspace panel would render nothing.
+    App::test((), |mut app| async move {
+        let terminal = terminal_view_for_viewer(&mut app);
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                !view.should_show_wasm_conversation_details_panel(ctx),
+                "WASM details button gate must return false for a plain terminal with no cloud task"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_button_shows_for_ambient_task() {
+    // REMOTE-2346: the pane-header `(i)` gate is narrower than the workspace panel gate. It must
+    // return true for an ambient-task pane that is neither a shared session nor a
+    // conversation-transcript viewer (surfaces that lack the simplified WASM tab-bar `(i)`).
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+        configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.should_show_wasm_pane_header_details_button(ctx),
+                "pane-header (i) must show for an ambient-task pane with no tab-bar affordance"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_button_hidden_for_transcript_viewer() {
+    // REMOTE-2346 regression: a conversation-transcript viewer already shows the simplified WASM
+    // tab-bar `(i)`, so the pane-header `(i)` must be suppressed to avoid a duplicate button —
+    // even though the broader workspace panel gate still returns true for that surface.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let task_id = configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_conversation_transcript_viewer_status(Some(
+                    ConversationTranscriptViewerStatus::ViewingAmbientConversation(task_id),
+                ));
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                view.should_show_wasm_conversation_details_panel(ctx),
+                "workspace panel gate must still show for a transcript viewer"
+            );
+            assert!(
+                !view.should_show_wasm_pane_header_details_button(ctx),
+                "pane-header (i) must be hidden for a transcript viewer (it already has the tab-bar (i))"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_wasm_details_panel_button_hidden_for_shared_session() {
+    // REMOTE-2346: a shared session already shows the simplified WASM tab-bar `(i)`, so the
+    // pane-header `(i)` must be suppressed there too.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        app.add_singleton_model(Manager::new);
+        let terminal = add_window_with_terminal(&mut app, None);
+        configure_ambient_details_panel_test(
+            &mut app,
+            &terminal,
+            create_cloud_mode_task_for_user(TEST_USER_UID),
+        );
+
+        terminal.update(&mut app, |view, _| {
+            view.model
+                .lock()
+                .set_shared_session_status(SharedSessionStatus::ActiveViewer {
+                    role: Default::default(),
+                });
+        });
+
+        terminal.read(&app, |view, ctx| {
+            assert!(
+                !view.should_show_wasm_pane_header_details_button(ctx),
+                "pane-header (i) must be hidden for a shared session (it already has the tab-bar (i))"
             );
         });
     });

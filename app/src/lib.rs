@@ -1361,6 +1361,7 @@ pub struct UpdateQuakeModeEventArg {
     active_window_id: Option<WindowId>,
 }
 
+#[derive(Clone)]
 enum StartupUserAuthentication {
     RefreshUser,
     ApiKey(String),
@@ -1375,13 +1376,53 @@ impl StartupUserAuthentication {
     }
 }
 
+/// Whether startup user authentication should proceed without blocking on IAP.
+///
+/// The TUI front-end must not stall its startup waiting for a staging IAP token
+/// the server may not even require, so it authenticates immediately and lets IAP
+/// resolve out of band (see [`authenticate_user_after_iap_access`]). Every other
+/// front-end keeps the blocking behavior. IAP config only exists on staging
+/// builds, so this never affects production.
+fn startup_auth_is_non_blocking(launch_mode: &LaunchMode) -> bool {
+    matches!(launch_mode, LaunchMode::Tui { .. })
+}
+
 fn authenticate_user_after_iap_access(
     authentication: StartupUserAuthentication,
+    non_blocking: bool,
     ctx: &mut AppContext,
 ) {
     let iap_manager = IapManager::handle(ctx);
     if !iap_manager.as_ref(ctx).is_enabled() || iap_manager.as_ref(ctx).has_valid_token() {
         authentication.start(ctx);
+        return;
+    }
+
+    if non_blocking {
+        // Don't stall startup waiting for an IAP token the server may not even
+        // require. Authenticate immediately; if the server DOES enforce IAP, this
+        // first attempt hits an IAP challenge, which notifies `IapManager` to mint
+        // a token (`observe_iap_challenge` -> `handle_challenge`). Once a valid
+        // token lands we retry auth so login still recovers — unless the
+        // optimistic attempt already established a session.
+        authentication.clone().start(ctx);
+        let mut pending_authentication = Some(authentication);
+        ctx.subscribe_to_model(&iap_manager, move |iap_manager, event, ctx| match event {
+            IapManagerEvent::StateChanged => {
+                if !iap_manager.as_ref(ctx).has_valid_token() {
+                    return;
+                }
+                if AuthStateProvider::as_ref(ctx).get().user_id().is_some() {
+                    pending_authentication = None;
+                    return;
+                }
+                if let Some(authentication) = pending_authentication.take() {
+                    authentication.start(ctx);
+                }
+            }
+            IapManagerEvent::AccessUnavailable | IapManagerEvent::RefreshFailed { .. } => {}
+        });
+        iap_manager.update(ctx, |manager, ctx| manager.ensure_access(ctx));
         return;
     }
 
@@ -1798,6 +1839,7 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(|_| ExecutionProfileEditorManager::default());
     ctx.add_singleton_model(|_| NetworkLogPaneManager::default());
     ctx.add_singleton_model(|_| pricing::PricingInfoModel::new());
+    ctx.add_singleton_model(ai::pricing_promotion::PricingPromotionState::new);
     ctx.add_singleton_model(|ctx| {
         // Not using the *Provider types isn't ideal, but it's worth it for the ability to move managed secrets to a separate crate.
         ManagedSecretManager::new(
@@ -2375,8 +2417,10 @@ pub(crate) fn initialize_app(
     });
 
     // CLI commands establish IAP access and refresh auth in their dispatch path so they can
-    // surface failures synchronously. Interactive clients wait for IAP here before authenticating
-    // their startup user, since the request itself calls the IAP-gated warp-server.
+    // surface failures synchronously. Other interactive clients gate startup user authentication
+    // on IAP here, since the request itself calls the IAP-gated warp-server — except the TUI,
+    // which authenticates immediately and resolves IAP out of band (see
+    // `startup_auth_is_non_blocking`).
     let startup_authentication = if matches!(launch_mode, LaunchMode::CommandLine { .. }) {
         None
     } else {
@@ -2385,7 +2429,11 @@ pub(crate) fn initialize_app(
             .or_else(|| user_is_logged_in.then_some(StartupUserAuthentication::RefreshUser))
     };
     if let Some(authentication) = startup_authentication {
-        authenticate_user_after_iap_access(authentication, ctx);
+        authenticate_user_after_iap_access(
+            authentication,
+            startup_auth_is_non_blocking(launch_mode),
+            ctx,
+        );
     }
 
     // Add a singleton model that holds the current prompt configuration.

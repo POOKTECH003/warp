@@ -50,6 +50,14 @@ impl OfferVariant {
         }
     }
 
+    pub(crate) fn primary_badge_label(self, pricing_promotion_message: Option<&str>) -> &str {
+        match self {
+            OfferVariant::HeadStart | OfferVariant::ChooseHowToStart => {
+                pricing_promotion_message.unwrap_or("Recommended")
+            }
+        }
+    }
+
     pub(crate) fn subtitle(self) -> Option<&'static str> {
         match self {
             OfferVariant::HeadStart => {
@@ -233,22 +241,38 @@ impl OfferSlide {
     }
 
     /// The credit packs to render, capped at [`MAX_CREDIT_PACKS`]. Empty when
-    /// the offer doesn't include the option or pricing hasn't arrived yet, in
-    /// which case the buy-credits card is not shown at all.
+    /// the offer doesn't include the option, the user isn't in the experiment
+    /// arm that surfaces packs, or pricing hasn't arrived yet — in any of which
+    /// cases the buy-credits card is not shown at all.
+    ///
+    /// The pack list stays loaded in the model regardless of arm, so a hidden
+    /// list is never confused with unavailable pricing (REV-1939).
     fn credit_packs<'a>(
         &self,
         variant: OfferVariant,
         app: &'a AppContext,
     ) -> &'a [CreditPackOption] {
-        if !variant.supports_credit_packs() {
+        let state = self.onboarding_state.as_ref(app);
+        if !variant.supports_credit_packs()
+            || !state
+                .choose_how_to_start_experiment_arm()
+                .shows_credit_packs()
+        {
             return &[];
         }
-        let packs = self.onboarding_state.as_ref(app).credit_pack_options();
+        let packs = state.credit_pack_options();
         &packs[..packs.len().min(MAX_CREDIT_PACKS)]
     }
 
     fn shows_credit_packs(&self, variant: OfferVariant, app: &AppContext) -> bool {
         !self.credit_packs(variant, app).is_empty()
+    }
+
+    fn primary_badge_label(&self, variant: OfferVariant, app: &AppContext) -> String {
+        let state = self.onboarding_state.as_ref(app);
+        variant
+            .primary_badge_label(state.pricing_promotion_message())
+            .to_owned()
     }
 
     /// The selectable options, top to bottom. Also the order the arrow keys
@@ -391,10 +415,12 @@ impl OfferSlide {
     ) -> Box<dyn Element> {
         let selected_choice = self.effective_choice(variant, app);
         let shows_credit_packs = self.shows_credit_packs(variant, app);
-        // The free-standard offer folds the plan and the one-time credit packs
-        // into a single "Use Warp with AI" card; every other offer keeps its
-        // plain selectable primary card.
-        let primary = if variant.supports_credit_packs() {
+        // Only when the credit packs are actually shown (the experiment arm with
+        // available packs) does the offer fold the plan and the packs into a
+        // single "Use Warp with AI" card. Control, unassigned, and
+        // experiment-without-packs users get the plain historical primary card
+        // with no pack UI (REV-1939).
+        let primary = if shows_credit_packs {
             self.render_use_ai_card(appearance, variant, selected_choice, app)
         } else {
             Self::render_option_card(
@@ -402,7 +428,7 @@ impl OfferSlide {
                 variant.primary_label(),
                 variant.primary_description(shows_credit_packs),
                 selected_choice == OfferChoice::Primary,
-                Some("Recommended"),
+                Some(self.primary_badge_label(variant, app)),
                 self.primary_mouse_state.clone(),
                 OfferSlideAction::SelectPrimary,
                 None,
@@ -468,11 +494,12 @@ impl OfferSlide {
             })
             .build()
             .finish();
+        let badge_label = self.primary_badge_label(variant, app);
         let green = theme.ansi_fg_green();
         let badge = Container::new(
             appearance
                 .ui_builder()
-                .paragraph("Recommended")
+                .paragraph(badge_label)
                 .with_style(UiComponentStyles {
                     font_size: Some(12.),
                     font_color: Some(green),
@@ -897,7 +924,7 @@ impl OfferSlide {
         label: &'static str,
         description: &'static str,
         selected: bool,
-        badge_label: Option<&'static str>,
+        badge_label: Option<String>,
         mouse_state: MouseStateHandle,
         action: OfferSlideAction,
         extra_content: Option<Box<dyn Element>>,
@@ -993,11 +1020,17 @@ impl OfferSlide {
     }
 
     fn send_action(&self, variant: OfferVariant, action: &str, ctx: &mut ViewContext<Self>) {
+        let experiment_arm = self
+            .onboarding_state
+            .as_ref(ctx)
+            .offer_experiment_arm()
+            .map(str::to_string);
         send_telemetry_from_ctx!(
             OnboardingEvent::OnboardingAction {
                 slide_name: variant.slide_name().to_string(),
                 action: action.to_string(),
                 account_class: Some(variant.account_class().to_string()),
+                experiment_arm,
             },
             ctx
         );
