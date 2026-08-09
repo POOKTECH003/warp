@@ -240,14 +240,28 @@ struct ConversationStreamState {
     subtree_seed_failures: usize,
 }
 
+/// Event scope of a viewer-mode entry's stream and cold-start seed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ViewerAnchorScope {
+    /// Direct children only (`?ancestor_run_id=` stream, `ancestor_run_id`
+    /// seed filter). The legacy scope; also the fallback whenever the
+    /// anchor's root-ness cannot be determined.
+    #[default]
+    DirectChildren,
+    /// The anchor's whole descendant subtree (`?subtree_root_run_id=`
+    /// stream, `root_run_id` seed filter). Only valid when the anchor is a
+    /// tree root — the server rejects mid-tree subtree anchors.
+    Subtree,
+}
+
 /// Per-orchestrator SSE stream state. Parallels [`ConversationStreamState`]
 /// but keyed on the orchestrator's `AmbientAgentTaskId` instead of on a
-/// specific conversation, so a single ancestor-scoped SSE connection can
-/// serve every consumer interested in that orchestrator's direct children.
+/// specific conversation, so a single viewer-scoped SSE connection can
+/// serve every consumer interested in that orchestrator's descendants.
 ///
 /// Today the only consumers are shared-session viewer panes (registered via
 /// [`Self::register_viewer_mode_consumer`]), which is why hydration and
-/// server-cursor push are absent on the ancestor path. See the note on
+/// server-cursor push are absent on the viewer path. See the note on
 /// [`AncestorForwardingConsumer`] for the future direction.
 #[derive(Default)]
 struct OrchestratorStreamState {
@@ -257,11 +271,17 @@ struct OrchestratorStreamState {
     /// panes viewing the same orchestrator each register independently and
     /// the entry survives until the last one unregisters.
     consumers: HashMap<EntityId, AIConversationId>,
-    /// Direct child `run_id`s observed via the ancestor SSE. Populated as
-    /// lifecycle events arrive and seeded from the cold-start REST snapshot.
-    /// Used to emit `ChildSpawned` exactly once per child; once a run_id is
-    /// in the set, subsequent observations only emit `ChildStatusChanged`.
+    /// Descendant `run_id`s observed via the viewer SSE (direct children
+    /// in `DirectChildren` scope; the whole subtree in `Subtree` scope).
+    /// Populated as lifecycle events arrive and seeded from the cold-start
+    /// REST snapshot. Used to emit `ChildSpawned` exactly once per run;
+    /// once a run_id is in the set, subsequent observations only emit
+    /// `ChildStatusChanged`.
     known_children: HashSet<String>,
+    /// Scope resolved during the cold-start seed: subtree for root anchors
+    /// (when multi-level orchestration is enabled), direct children
+    /// otherwise.
+    anchor_scope: ViewerAnchorScope,
     /// Active ancestor SSE connection, if one is open.
     sse_connection: Option<AncestorSseConnectionState>,
     /// In-memory event cursor for the ancestor stream. Mirrors the
@@ -325,16 +345,28 @@ pub enum OrchestrationEventStreamerEvent {
         conversation_id: AIConversationId,
         wake_message: AgentMessageEventMetadata,
     },
-    /// First time the streamer has seen a particular `run_id` under
-    /// `parent_task_id`. Emitted exactly once per child.
+    /// First time the streamer has seen a particular `run_id` in
+    /// `parent_task_id`'s viewer-mode scope. Emitted exactly once per run.
+    ///
+    /// `parent_task_id` identifies the stream anchor (the orchestrator the
+    /// viewer registered for), NOT necessarily the run's direct parent: on
+    /// subtree-scoped streams the run may be a grandchild or deeper.
+    /// `parent_run_id` carries the run's actual parent from the wire event
+    /// when the server provided one; `None` on replays of already-known
+    /// children and on old servers, in which case consumers should resolve
+    /// the parent from the run's fetched task metadata.
     ChildSpawned {
         parent_task_id: AmbientAgentTaskId,
         run_id: String,
+        parent_run_id: Option<String>,
     },
-    /// Lifecycle transition for a known child under `parent_task_id`.
+    /// Lifecycle transition for a known run in `parent_task_id`'s
+    /// viewer-mode scope. See [`Self::ChildSpawned`] for the
+    /// anchor-vs-actual-parent distinction.
     ChildStatusChanged {
         parent_task_id: AmbientAgentTaskId,
         run_id: String,
+        parent_run_id: Option<String>,
         status: ConversationStatus,
     },
     /// Lifecycle transition observed on an owner-side stream for a watched run.
@@ -786,9 +818,12 @@ impl OrchestrationEventStreamer {
         ctx: &mut ModelContext<Self>,
     ) {
         for run_id in run_ids {
+            // Seed rows and replays don't carry a wire event; consumers
+            // resolve the actual parent from the run's task metadata.
             ctx.emit(OrchestrationEventStreamerEvent::ChildSpawned {
                 parent_task_id,
                 run_id,
+                parent_run_id: None,
             });
         }
     }
@@ -806,18 +841,62 @@ impl OrchestrationEventStreamer {
 
     // ---- Ancestor SSE consumer (viewer-mode driver wiring) -----------
 
-    /// One-shot `?ancestor_run_id=` REST fetch that seeds the per-
-    /// orchestrator entry's known-child set and SSE cursor. The ancestor
-    /// SSE opens automatically once the seed lands.
+    /// Kicks off the cold-start REST seed for `parent_task_id`. With
+    /// multi-level orchestration enabled, first resolves whether the anchor
+    /// is a tree root (its task has no `parent_run_id`) so root anchors can
+    /// seed and stream their whole subtree; mid-tree anchors — and any
+    /// anchor whose root-ness cannot be determined — keep the legacy
+    /// direct-children scope. The viewer SSE opens automatically once the
+    /// seed lands.
     fn spawn_ancestor_seed_fetch(
         &mut self,
         parent_task_id: AmbientAgentTaskId,
         ctx: &mut ModelContext<Self>,
     ) {
+        if !FeatureFlag::MultiLevelOrchestration.is_enabled() {
+            self.spawn_viewer_seed_list(parent_task_id, ViewerAnchorScope::DirectChildren, ctx);
+            return;
+        }
         let ai_client = self.ai_client.clone();
-        let filter = TaskListFilter {
-            ancestor_run_id: Some(parent_task_id.to_string()),
-            ..TaskListFilter::default()
+        ctx.spawn(
+            async move { ai_client.get_ambient_agent_task(&parent_task_id).await },
+            move |me, result, ctx| {
+                let scope = match result {
+                    Ok(task) if task.parent_run_id.is_none() => ViewerAnchorScope::Subtree,
+                    Ok(_) => ViewerAnchorScope::DirectChildren,
+                    Err(err) => {
+                        log::warn!(
+                            "[orch-viewer-streamer] anchor root-ness fetch failed for \
+                             parent_task_id={parent_task_id}: {err:#}; falling back to \
+                             direct-children scope"
+                        );
+                        ViewerAnchorScope::DirectChildren
+                    }
+                };
+                me.spawn_viewer_seed_list(parent_task_id, scope, ctx);
+            },
+        );
+    }
+
+    /// Issues the scope-appropriate task-list fetch (`root_run_id` for
+    /// subtree scope, `ancestor_run_id` for direct children) and routes the
+    /// result through [`Self::finish_ancestor_seed_fetch`].
+    fn spawn_viewer_seed_list(
+        &mut self,
+        parent_task_id: AmbientAgentTaskId,
+        scope: ViewerAnchorScope,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let ai_client = self.ai_client.clone();
+        let filter = match scope {
+            ViewerAnchorScope::DirectChildren => TaskListFilter {
+                ancestor_run_id: Some(parent_task_id.to_string()),
+                ..TaskListFilter::default()
+            },
+            ViewerAnchorScope::Subtree => TaskListFilter {
+                root_run_id: Some(parent_task_id.to_string()),
+                ..TaskListFilter::default()
+            },
         };
         ctx.spawn(
             async move {
@@ -826,19 +905,21 @@ impl OrchestrationEventStreamer {
                     .await
             },
             move |me, result, ctx| {
-                me.finish_ancestor_seed_fetch(parent_task_id, result, ctx);
+                me.finish_ancestor_seed_fetch(parent_task_id, scope, result, ctx);
             },
         );
     }
 
-    /// Applies the cold-start REST seed: populates `known_children` from
-    /// the response, advances `event_cursor` to `max(server, local)`, marks
-    /// the entry seeded, and opens the ancestor SSE. Failures are logged
-    /// and retried at registration time (the SSE never opens on a failed
-    /// seed, so re-registering kicks the fetch off again).
+    /// Applies the cold-start REST seed: records the resolved scope,
+    /// populates `known_children` from the response, advances
+    /// `event_cursor` to `max(server, local)`, marks the entry seeded, and
+    /// opens the viewer SSE. Failures are logged and retried at
+    /// registration time (the SSE never opens on a failed seed, so
+    /// re-registering kicks the fetch off again).
     fn finish_ancestor_seed_fetch(
         &mut self,
         parent_task_id: AmbientAgentTaskId,
+        scope: ViewerAnchorScope,
         result: anyhow::Result<Vec<crate::ai::ambient_agents::task::AmbientAgentTask>>,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -863,7 +944,7 @@ impl OrchestrationEventStreamer {
                     for task in tasks {
                         if task.task_id == parent_task_id {
                             // The server endpoint may include the parent itself;
-                            // skip it — only direct children are tracked.
+                            // skip it — only descendants are tracked.
                             continue;
                         }
                         let run_id = task.task_id.to_string();
@@ -874,6 +955,7 @@ impl OrchestrationEventStreamer {
                         }
                     }
                     entry.event_cursor = seed;
+                    entry.anchor_scope = scope;
                     entry.seeded = true;
                     log::debug!(
                         "[orch-viewer-streamer] ancestor seed applied for parent_task_id={parent_task_id}: \
@@ -917,7 +999,7 @@ impl OrchestrationEventStreamer {
         self.start_ancestor_sse(parent_task_id, cursor, ctx);
     }
 
-    /// Opens the ancestor SSE driver for `parent_task_id`. Events are
+    /// Opens the viewer SSE driver for `parent_task_id`. Events are
     /// forwarded through an mpsc channel and drained by a periodic timer
     /// (mirroring the per-conversation pipeline). The driver itself reuses
     /// `run_agent_event_driver::retry_forever` so reconnect / backoff /
@@ -928,22 +1010,33 @@ impl OrchestrationEventStreamer {
         cursor: i64,
         ctx: &mut ModelContext<Self>,
     ) {
+        let scope = self
+            .viewer_mode_orchestrators
+            .get(&parent_task_id)
+            .map(|entry| entry.anchor_scope)
+            .unwrap_or_default();
         let server_api = self.server_api.clone();
         let (tx, rx) = mpsc::unbounded();
         let generation = self.next_sse_generation;
         self.next_sse_generation += 1;
 
         log::info!(
-            "Opening ancestor SSE for parent_task_id={parent_task_id} \
-             (gen={generation}, since={cursor})"
+            "Opening viewer SSE for parent_task_id={parent_task_id} \
+             (gen={generation}, since={cursor}, scope={scope:?})"
         );
 
-        // Viewer mode subscribes to direct children only: it surfaces child
-        // lifecycle in the pill bar and never needs the orchestrator's inbox,
-        // so `include_self` stays false to preserve the existing contract.
-        let filter = AgentEventFilter::AncestorRunId {
-            ancestor_run_id: parent_task_id.to_string(),
-            include_self: false,
+        // The viewer never needs the orchestrator's inbox: it only surfaces
+        // descendant lifecycle in the pill bar. Direct-children scope keeps
+        // `include_self=false`; subtree scope inherently includes the root's
+        // own events, which the drain loop skips.
+        let filter = match scope {
+            ViewerAnchorScope::DirectChildren => AgentEventFilter::AncestorRunId {
+                ancestor_run_id: parent_task_id.to_string(),
+                include_self: false,
+            },
+            ViewerAnchorScope::Subtree => AgentEventFilter::SubtreeRootRunId {
+                root_run_id: parent_task_id.to_string(),
+            },
         };
         let config = AgentEventDriverConfig::retry_forever(filter, cursor);
         let source = ServerApiAgentEventSource::new(server_api);
@@ -1041,17 +1134,23 @@ impl OrchestrationEventStreamer {
             return;
         }
 
+        let anchor_run_id = parent_task_id.to_string();
         for event in events {
             // Drop `new_message` events: viewer-mode consumers only surface
             // lifecycle transitions. We still advance the cursor so the
             // SSE replay on reconnect doesn't re-deliver them.
             cursor = cursor.max(event.sequence);
+            // Subtree streams inherently include the anchor's own events;
+            // the viewer never surfaces the orchestrator to itself.
+            if event.run_id == anchor_run_id {
+                continue;
+            }
             let Some(lifecycle_type) = lifecycle_event_type_from_wire(event.event_type.as_str())
             else {
                 continue;
             };
             let run_id = event.run_id.clone();
-            // First observation of a child run_id under this parent: emit
+            // First observation of a run_id in this anchor's scope: emit
             // `ChildSpawned` exactly once before any status events. The
             // cold-start seed populates `known_children` so already-known
             // children replayed on reconnect do NOT generate a spawn event.
@@ -1063,12 +1162,14 @@ impl OrchestrationEventStreamer {
                 ctx.emit(OrchestrationEventStreamerEvent::ChildSpawned {
                     parent_task_id,
                     run_id: run_id.clone(),
+                    parent_run_id: event.parent_run_id.clone(),
                 });
             }
             let status = conversation_status_from_lifecycle_event_type(lifecycle_type);
             ctx.emit(OrchestrationEventStreamerEvent::ChildStatusChanged {
                 parent_task_id,
                 run_id,
+                parent_run_id: event.parent_run_id.clone(),
                 status,
             });
         }

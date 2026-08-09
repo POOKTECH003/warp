@@ -1804,6 +1804,7 @@ fn capture_child_spawns(
             if let OrchestrationEventStreamerEvent::ChildSpawned {
                 parent_task_id,
                 run_id,
+                ..
             } = event
             {
                 captured_for_closure
@@ -1857,6 +1858,7 @@ fn finish_ancestor_seed_fetch_emits_child_spawned_for_each_seeded_child() {
         streamer.update(&mut app, |me, ctx| {
             me.finish_ancestor_seed_fetch(
                 parent_task_id,
+                ViewerAnchorScope::DirectChildren,
                 Ok(vec![
                     make_ambient_task_with_task_id(parent_task_id, Some(5)),
                     make_ambient_task_with_task_id(child_a, Some(11)),
@@ -1938,6 +1940,7 @@ fn register_viewer_mode_consumer_replays_known_children_for_later_panes() {
             me.register_viewer_mode_consumer(parent_task_id, placeholder_a, consumer_a, ctx);
             me.finish_ancestor_seed_fetch(
                 parent_task_id,
+                ViewerAnchorScope::DirectChildren,
                 Ok(vec![make_ambient_task_with_task_id(child_a, Some(3))]),
                 ctx,
             );
@@ -3733,6 +3736,147 @@ fn subtree_restore_seed_skips_runs_already_known_locally() {
                 model.child_conversation_ids_of(&root_id),
                 &[child_id],
                 "seeding must not duplicate restored placeholders"
+            );
+        });
+    });
+}
+
+// ---- Viewer-mode subtree scope ---------------------------------------------
+
+#[test]
+fn viewer_seed_records_subtree_scope_and_tracks_all_descendants() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let streamer = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        let anchor = make_parent_task_id_for_test(0xf1);
+        let child = make_parent_task_id_for_test(0xf2);
+        let grandchild = make_parent_task_id_for_test(0xf3);
+        let consumer_id = warpui::EntityId::new();
+        let placeholder = crate::ai::agent::conversation::AIConversation::new(true, false).id();
+        streamer.update(&mut app, |me, ctx| {
+            me.register_viewer_mode_consumer(anchor, placeholder, consumer_id, ctx);
+            me.finish_ancestor_seed_fetch(
+                anchor,
+                ViewerAnchorScope::Subtree,
+                Ok(vec![
+                    make_ambient_task_with_task_id(child, Some(3)),
+                    make_ambient_task_with_task_id(grandchild, Some(4)),
+                ]),
+                ctx,
+            );
+        });
+
+        streamer.read(&app, |me, _| {
+            let entry = me
+                .viewer_mode_orchestrators
+                .get(&anchor)
+                .expect("viewer-mode entry exists after seed");
+            assert_eq!(entry.anchor_scope, ViewerAnchorScope::Subtree);
+            assert!(entry.known_children.contains(&child.to_string()));
+            assert!(
+                entry.known_children.contains(&grandchild.to_string()),
+                "subtree seeds track descendants at every depth"
+            );
+        });
+    });
+}
+
+#[test]
+fn viewer_drain_skips_anchor_events_and_carries_parent_run_id() {
+    // On subtree streams the anchor's own events arrive too; the drain must
+    // skip them (the viewer never surfaces the orchestrator to itself) while
+    // still advancing the cursor, and descendant emissions must carry the
+    // wire event's actual parent run id.
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let streamer = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        let anchor = make_parent_task_id_for_test(0xf4);
+        let child = make_parent_task_id_for_test(0xf5);
+        let grandchild = make_parent_task_id_for_test(0xf6);
+        let consumer_id = warpui::EntityId::new();
+        let placeholder = crate::ai::agent::conversation::AIConversation::new(true, false).id();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        streamer.update(&mut app, |me, ctx| {
+            me.register_viewer_mode_consumer(anchor, placeholder, consumer_id, ctx);
+            let entry = me
+                .viewer_mode_orchestrators
+                .get_mut(&anchor)
+                .expect("viewer-mode entry exists after registration");
+            entry.anchor_scope = ViewerAnchorScope::Subtree;
+            entry.seeded = true;
+            let (abort_handle, _) = futures::future::AbortHandle::new_pair();
+            entry.sse_connection = Some(AncestorSseConnectionState {
+                event_receiver: rx,
+                generation: 0,
+                abort_handle,
+            });
+            me.next_sse_generation = 1;
+        });
+
+        type CapturedSpawns = std::sync::Arc<parking_lot::Mutex<Vec<(String, Option<String>)>>>;
+        let captured: CapturedSpawns = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured_for_closure = captured.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_model(&streamer, move |_, event, _| {
+                if let OrchestrationEventStreamerEvent::ChildSpawned {
+                    run_id,
+                    parent_run_id,
+                    ..
+                } = event
+                {
+                    captured_for_closure
+                        .lock()
+                        .push((run_id.clone(), parent_run_id.clone()));
+                }
+            })
+        });
+
+        let mut anchor_event = make_lifecycle_event("run_in_progress", &anchor.to_string(), 1);
+        anchor_event.depth = Some(0);
+        let mut grandchild_event =
+            make_lifecycle_event("run_succeeded", &grandchild.to_string(), 2);
+        grandchild_event.parent_run_id = Some(child.to_string());
+        grandchild_event.depth = Some(2);
+        tx.unbounded_send(AncestorSseStreamItem {
+            event: anchor_event,
+        })
+        .unwrap();
+        tx.unbounded_send(AncestorSseStreamItem {
+            event: grandchild_event,
+        })
+        .unwrap();
+
+        streamer.update(&mut app, |me, ctx| {
+            me.drain_ancestor_events(anchor, ctx);
+        });
+
+        assert_eq!(
+            captured.lock().clone(),
+            vec![(grandchild.to_string(), Some(child.to_string()))],
+            "only the descendant spawns, carrying its actual parent run id"
+        );
+        streamer.read(&app, |me, _| {
+            let entry = me
+                .viewer_mode_orchestrators
+                .get(&anchor)
+                .expect("viewer-mode entry exists");
+            assert!(
+                !entry.known_children.contains(&anchor.to_string()),
+                "the anchor's own events must not be tracked as children"
+            );
+            assert_eq!(
+                entry.event_cursor, 2,
+                "the cursor advances across skipped anchor events"
             );
         });
     });

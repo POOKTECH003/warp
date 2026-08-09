@@ -91,6 +91,7 @@ const PARENT_TASK_ID: &str = "11111111-1111-1111-1111-111111111111";
 const CHILD_A_TASK_ID: &str = "22222222-2222-2222-2222-222222222222";
 const CHILD_B_TASK_ID: &str = "33333333-3333-3333-3333-333333333333";
 const SESSION_A: &str = "44444444-4444-4444-4444-444444444444";
+const GRANDCHILD_TASK_ID: &str = "55555555-5555-5555-5555-555555555555";
 
 fn task_id(s: &str) -> AmbientAgentTaskId {
     s.parse().expect("hardcoded task id parses")
@@ -104,6 +105,20 @@ fn make_task(
     session_id: Option<&str>,
 ) -> AmbientAgentTask {
     make_task_with_name(id, state, None, title, session_id)
+}
+
+/// Like [`make_task`], but parented under an arbitrary run instead of the
+/// anchor — the shape of a grandchild (or deeper) row on subtree streams.
+fn make_task_with_parent_run(
+    id: &str,
+    parent_run_id: &str,
+    state: AmbientAgentTaskState,
+    title: &str,
+    session_id: Option<&str>,
+) -> AmbientAgentTask {
+    let mut task = make_task(id, state, title, session_id);
+    task.parent_run_id = Some(parent_run_id.to_string());
+    task
 }
 
 fn make_task_with_name(
@@ -169,6 +184,7 @@ fn setup_model(
         terminal_view: terminal_view.downgrade(),
         children: HashMap::new(),
         children_by_run_id: HashMap::new(),
+        children_waiting_on_parent: HashMap::new(),
         pending_session_id_poll_handle: None,
         metadata_fetch_dispatch_count: 0,
     };
@@ -291,6 +307,7 @@ fn skips_child_when_no_active_parent_conversation() {
             terminal_view: terminal_view.downgrade(),
             children: HashMap::new(),
             children_by_run_id: HashMap::new(),
+            children_waiting_on_parent: HashMap::new(),
             pending_session_id_poll_handle: None,
             metadata_fetch_dispatch_count: 0,
         };
@@ -691,7 +708,12 @@ fn child_status_changed_with_unknown_run_id_is_silently_dropped() {
 
         // No children registered yet — the run_id is unknown to the local map.
         model_handle.update(&mut app, |model, ctx| {
-            model.handle_child_status_changed("unknown-run-id", ConversationStatus::Success, ctx);
+            model.handle_child_status_changed(
+                "unknown-run-id",
+                None,
+                ConversationStatus::Success,
+                ctx,
+            );
         });
 
         // Should be a no-op: no panic, no new placeholders, no children added.
@@ -734,7 +756,12 @@ fn child_status_changed_updates_existing_placeholder_via_local_map() {
 
         // Step 2: a ChildStatusChanged event lands for the same run_id.
         model_handle.update(&mut app, |model, ctx| {
-            model.handle_child_status_changed(CHILD_A_TASK_ID, ConversationStatus::Success, ctx);
+            model.handle_child_status_changed(
+                CHILD_A_TASK_ID,
+                None,
+                ConversationStatus::Success,
+                ctx,
+            );
         });
 
         // The placeholder's status should reflect Success.
@@ -789,7 +816,12 @@ fn child_status_changed_refetches_metadata_while_session_id_is_pending() {
         // ChildStatusChanged arrives — the entry still has no session_id,
         // so handle_child_status_changed must dispatch a refetch.
         model_handle.update(&mut app, |model, ctx| {
-            model.handle_child_status_changed(CHILD_A_TASK_ID, ConversationStatus::InProgress, ctx);
+            model.handle_child_status_changed(
+                CHILD_A_TASK_ID,
+                None,
+                ConversationStatus::InProgress,
+                ctx,
+            );
         });
         model_handle.read(&app, |model, _| {
             assert_eq!(
@@ -831,7 +863,12 @@ fn child_status_changed_refetches_metadata_while_session_id_is_pending() {
         // materialized) must NOT dispatch another refetch — status writes
         // are sufficient once we have session_id + materialization done.
         model_handle.update(&mut app, |model, ctx| {
-            model.handle_child_status_changed(CHILD_A_TASK_ID, ConversationStatus::Success, ctx);
+            model.handle_child_status_changed(
+                CHILD_A_TASK_ID,
+                None,
+                ConversationStatus::Success,
+                ctx,
+            );
         });
         model_handle.read(&app, |model, _| {
             assert_eq!(
@@ -1057,7 +1094,7 @@ fn child_status_changed_does_not_refetch_when_already_materialized() {
             ConversationStatus::Cancelled,
         ] {
             model_handle.update(&mut app, |model, ctx| {
-                model.handle_child_status_changed(CHILD_A_TASK_ID, status, ctx);
+                model.handle_child_status_changed(CHILD_A_TASK_ID, None, status, ctx);
             });
         }
         model_handle.read(&app, |model, _| {
@@ -1346,6 +1383,7 @@ fn handle_streamer_event_filters_on_parent_task_id() {
                 &OrchestrationEventStreamerEvent::ChildStatusChanged {
                     parent_task_id: other_parent,
                     run_id: CHILD_A_TASK_ID.to_string(),
+                    parent_run_id: None,
                     status: ConversationStatus::Cancelled,
                 },
                 ctx,
@@ -1372,7 +1410,7 @@ fn child_spawned_with_malformed_run_id_is_dropped() {
         let model_handle = app.add_model(|_| model);
 
         model_handle.update(&mut app, |model, ctx| {
-            model.handle_child_spawned("not-a-uuid".to_string(), ctx);
+            model.handle_child_spawned("not-a-uuid".to_string(), None, ctx);
         });
 
         model_handle.read(&app, |model, _| {
@@ -1560,4 +1598,145 @@ fn _mock_with_get_ambient_agent_task_for_child(task: AmbientAgentTask) -> Arc<dy
 #[allow(dead_code)]
 fn _server_api_for_test() -> Arc<crate::server::server_api::ServerApi> {
     ServerApiProvider::new_for_test().get()
+}
+
+// ---- Nested descendant placement (subtree streams) --------------------------
+
+#[test]
+fn registers_grandchild_under_its_parent_placeholder() {
+    App::test((), |mut app| async move {
+        let parent = task_id(PARENT_TASK_ID);
+        let (_, parent_conv_id, model) = setup_model(&mut app, parent);
+        let model_handle = app.add_model(|_| model);
+
+        model_handle.update(&mut app, |model, ctx| {
+            model.register_child(
+                make_task(
+                    CHILD_A_TASK_ID,
+                    AmbientAgentTaskState::InProgress,
+                    "Worker",
+                    None,
+                ),
+                ctx,
+            );
+            model.register_child(
+                make_task_with_parent_run(
+                    GRANDCHILD_TASK_ID,
+                    CHILD_A_TASK_ID,
+                    AmbientAgentTaskState::InProgress,
+                    "Nested worker",
+                    None,
+                ),
+                ctx,
+            );
+        });
+
+        let (child_conv_id, grandchild_conv_id) = model_handle.read(&app, |model, _| {
+            (
+                model
+                    .children
+                    .get(&task_id(CHILD_A_TASK_ID))
+                    .expect("child registered")
+                    .conversation_id,
+                model
+                    .children
+                    .get(&task_id(GRANDCHILD_TASK_ID))
+                    .expect("grandchild registered")
+                    .conversation_id,
+            )
+        });
+        let history = BlocklistAIHistoryModel::handle(&app);
+        history.read(&app, |history, _| {
+            assert!(
+                history
+                    .child_conversation_ids_of(&child_conv_id)
+                    .contains(&grandchild_conv_id),
+                "the grandchild must attach under its actual parent's placeholder"
+            );
+            assert!(
+                !history
+                    .child_conversation_ids_of(&parent_conv_id)
+                    .contains(&grandchild_conv_id),
+                "the grandchild must not be hard-attributed to the stream anchor"
+            );
+        });
+    });
+}
+
+#[test]
+fn parks_grandchild_until_parent_registers_then_drains() {
+    // Subtree seeds and events can arrive out of dependency order: a
+    // grandchild observed before its parent parks until the parent's
+    // placeholder registers, then drains under it.
+    App::test((), |mut app| async move {
+        let parent = task_id(PARENT_TASK_ID);
+        let (_, _, model) = setup_model(&mut app, parent);
+        let model_handle = app.add_model(|_| model);
+
+        model_handle.update(&mut app, |model, ctx| {
+            model.register_child(
+                make_task_with_parent_run(
+                    GRANDCHILD_TASK_ID,
+                    CHILD_A_TASK_ID,
+                    AmbientAgentTaskState::InProgress,
+                    "Nested worker",
+                    None,
+                ),
+                ctx,
+            );
+        });
+        model_handle.read(&app, |model, _| {
+            assert!(
+                !model.children.contains_key(&task_id(GRANDCHILD_TASK_ID)),
+                "the grandchild must park while its parent run is unknown"
+            );
+            assert_eq!(
+                model
+                    .children_waiting_on_parent
+                    .get(CHILD_A_TASK_ID)
+                    .map(|tasks| tasks.len()),
+                Some(1)
+            );
+        });
+
+        model_handle.update(&mut app, |model, ctx| {
+            model.register_child(
+                make_task(
+                    CHILD_A_TASK_ID,
+                    AmbientAgentTaskState::InProgress,
+                    "Worker",
+                    None,
+                ),
+                ctx,
+            );
+        });
+
+        model_handle.read(&app, |model, _| {
+            assert!(model.children_waiting_on_parent.is_empty());
+            assert!(model.children.contains_key(&task_id(GRANDCHILD_TASK_ID)));
+        });
+        let (child_conv_id, grandchild_conv_id) = model_handle.read(&app, |model, _| {
+            (
+                model
+                    .children
+                    .get(&task_id(CHILD_A_TASK_ID))
+                    .expect("child registered")
+                    .conversation_id,
+                model
+                    .children
+                    .get(&task_id(GRANDCHILD_TASK_ID))
+                    .expect("grandchild drained")
+                    .conversation_id,
+            )
+        });
+        let history = BlocklistAIHistoryModel::handle(&app);
+        history.read(&app, |history, _| {
+            assert!(
+                history
+                    .child_conversation_ids_of(&child_conv_id)
+                    .contains(&grandchild_conv_id),
+                "the drained grandchild must attach under its parent's placeholder"
+            );
+        });
+    });
 }

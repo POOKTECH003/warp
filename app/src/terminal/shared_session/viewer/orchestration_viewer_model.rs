@@ -1,10 +1,13 @@
 //! Drives the orchestration pill bar in shared session viewers.
 //!
 //! After the viewer joins a parent ambient-agent session, this model
-//! discovers and tracks the parent's direct children via the
-//! [`OrchestrationEventStreamer`], which opens an ancestor SSE (seeded
+//! discovers and tracks the parent's descendants via the
+//! [`OrchestrationEventStreamer`], which opens a viewer SSE (subtree-scoped
+//! for tree-root anchors, direct-children ancestor scope otherwise; seeded
 //! by a one-shot REST snapshot) and broadcasts `ChildSpawned` /
-//! `ChildStatusChanged` events.
+//! `ChildStatusChanged` events. Descendants below the direct-child level
+//! are attached under their actual parent's placeholder, so the viewer
+//! renders the same nested topology as the owner.
 //!
 //! Each viewer pane has its own model with its own placeholder
 //! conversations; the streamer is a shared singleton.
@@ -47,11 +50,16 @@ pub struct OrchestrationViewerModel {
     parent_task_id: AmbientAgentTaskId,
     terminal_view_id: EntityId,
     terminal_view: WeakViewHandle<TerminalView>,
-    /// Placeholder conversations materialized for direct children.
+    /// Placeholder conversations materialized for tracked descendants.
     children: HashMap<AmbientAgentTaskId, ChildAgentEntry>,
     /// Secondary index keyed by stringified `run_id`, used by the streamer
     /// broadcast event handler. Kept in sync with `children`.
     children_by_run_id: HashMap<String, AmbientAgentTaskId>,
+    /// Fetched descendant tasks whose parent run has no placeholder yet
+    /// (subtree seeds and events can arrive out of dependency order),
+    /// keyed by the missing parent run_id. Drained when the parent
+    /// registers.
+    children_waiting_on_parent: HashMap<String, Vec<AmbientAgentTask>>,
     /// Periodic timer fetching the claim-time `session_id` for
     /// not-yet-claimed children.
     pending_session_id_poll_handle: Option<SpawnedFutureHandle>,
@@ -96,6 +104,7 @@ impl OrchestrationViewerModel {
             terminal_view,
             children: HashMap::new(),
             children_by_run_id: HashMap::new(),
+            children_waiting_on_parent: HashMap::new(),
             pending_session_id_poll_handle: None,
             #[cfg(test)]
             metadata_fetch_dispatch_count: 0,
@@ -188,18 +197,28 @@ impl OrchestrationViewerModel {
         ctx: &mut ModelContext<Self>,
     ) {
         match event {
+            // `parent_task_id` is the stream anchor; `parent_run_id` is the
+            // run's actual parent from the wire event, used as a placement
+            // hint when the fetched task metadata lacks one.
             OrchestrationEventStreamerEvent::ChildSpawned {
                 parent_task_id,
                 run_id,
+                parent_run_id,
             } if *parent_task_id == self.parent_task_id => {
-                self.handle_child_spawned(run_id.clone(), ctx);
+                self.handle_child_spawned(run_id.clone(), parent_run_id.clone(), ctx);
             }
             OrchestrationEventStreamerEvent::ChildStatusChanged {
                 parent_task_id,
                 run_id,
+                parent_run_id,
                 status,
             } if *parent_task_id == self.parent_task_id => {
-                self.handle_child_status_changed(run_id, status.clone(), ctx);
+                self.handle_child_status_changed(
+                    run_id,
+                    parent_run_id.clone(),
+                    status.clone(),
+                    ctx,
+                );
             }
             // Other orchestrators (or non-viewer-mode variants) are ignored.
             _ => {}
@@ -209,7 +228,12 @@ impl OrchestrationViewerModel {
     /// First observation of a child `run_id`. Fetches pill metadata and
     /// dispatches to `register_child`. Dropped events are retried on the
     /// next status change for the same `run_id`.
-    fn handle_child_spawned(&mut self, run_id: String, ctx: &mut ModelContext<Self>) {
+    fn handle_child_spawned(
+        &mut self,
+        run_id: String,
+        parent_run_id_hint: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
         let Ok(task_id) = run_id.parse::<AmbientAgentTaskId>() else {
             log::warn!("[orch-viewer] ChildSpawned with malformed run_id={run_id:?}; dropping");
             return;
@@ -219,7 +243,7 @@ impl OrchestrationViewerModel {
             return;
         }
 
-        self.spawn_task_metadata_fetch(task_id, "ChildSpawned", ctx);
+        self.spawn_task_metadata_fetch(task_id, parent_run_id_hint, "ChildSpawned", ctx);
     }
 
     /// Writes the new status through `BlocklistAIHistoryModel`. If the
@@ -229,6 +253,7 @@ impl OrchestrationViewerModel {
     fn handle_child_status_changed(
         &mut self,
         run_id: &str,
+        parent_run_id_hint: Option<String>,
         status: ConversationStatus,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -248,7 +273,7 @@ impl OrchestrationViewerModel {
         });
 
         if needs_metadata_refetch {
-            self.spawn_task_metadata_fetch(task_id, "ChildStatusChanged", ctx);
+            self.spawn_task_metadata_fetch(task_id, parent_run_id_hint, "ChildStatusChanged", ctx);
         }
     }
 
@@ -258,6 +283,7 @@ impl OrchestrationViewerModel {
     fn spawn_task_metadata_fetch(
         &mut self,
         task_id: AmbientAgentTaskId,
+        parent_run_id_hint: Option<String>,
         trigger: &'static str,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -281,23 +307,41 @@ impl OrchestrationViewerModel {
                         return;
                     }
                 };
-                me.register_child(task, ctx);
+                me.register_child_with_parent_hint(task, parent_run_id_hint, ctx);
             },
         );
     }
 
     // ---- Shared child registration (used by both paths) -----------------
 
+    /// [`Self::register_child_with_parent_hint`] without a wire-event
+    /// placement hint (seed rows and refetch loops resolve the parent from
+    /// task metadata alone).
+    fn register_child(&mut self, task: AmbientAgentTask, ctx: &mut ModelContext<Self>) {
+        self.register_child_with_parent_hint(task, None, ctx);
+    }
+
     /// Creates the local placeholder conversation for a child task,
     /// records it in the per-pane map, and emits
     /// `EnsureSharedSessionViewerChildPane` if a session id is already
     /// known. Idempotent: a second call for the same `task_id` updates
-    /// status / session-id only.
-    fn register_child(&mut self, task: AmbientAgentTask, ctx: &mut ModelContext<Self>) {
-        // The server-side ancestor endpoint includes the parent itself in
+    /// status / session-id only. `parent_run_id_hint` is the wire event's
+    /// parent attribution, used when the fetched task metadata lacks one.
+    fn register_child_with_parent_hint(
+        &mut self,
+        mut task: AmbientAgentTask,
+        parent_run_id_hint: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        // The server-side list endpoints may include the anchor itself in
         // the response; skip it.
         if task.task_id == self.parent_task_id {
             return;
+        }
+        // Materialize the hint onto the task so parking (below) and any
+        // later re-registration keep the attribution.
+        if task.parent_run_id.is_none() {
+            task.parent_run_id = parent_run_id_hint;
         }
 
         let task_id = task.task_id;
@@ -344,10 +388,42 @@ impl OrchestrationViewerModel {
             return;
         }
 
-        // New child: register under the orchestrator's local conversation.
-        // Without an active parent conversation, `start_new_child_conversation`
-        // would lose the parent linkage. Drop and try again next cycle/event.
-        let Some(parent_conversation_id) = self.find_parent_conversation_id(ctx) else {
+        // New descendant: resolve the conversation it attaches under. Direct
+        // children of the anchor (and rows from old servers that omit
+        // `parent_run_id`) attach to the orchestrator's local conversation;
+        // deeper descendants attach under their actual parent's placeholder,
+        // parking until that placeholder exists (subtree seeds and events can
+        // arrive out of dependency order).
+        let anchor_run_id = self.parent_task_id.to_string();
+        let parent_conversation_id = match task.parent_run_id.as_deref() {
+            None => self.find_parent_conversation_id(ctx),
+            Some(parent) if parent == anchor_run_id => self.find_parent_conversation_id(ctx),
+            Some(parent) => {
+                let parent_entry = self
+                    .children_by_run_id
+                    .get(parent)
+                    .and_then(|parent_task_id| self.children.get(parent_task_id));
+                match parent_entry {
+                    Some(entry) => Some(entry.conversation_id),
+                    None => {
+                        log::info!(
+                            "[orch-viewer] parking descendant task_id={task_id} until its \
+                             parent run {parent} registers (anchor={})",
+                            self.parent_task_id,
+                        );
+                        self.children_waiting_on_parent
+                            .entry(parent.to_string())
+                            .or_default()
+                            .push(task);
+                        return;
+                    }
+                }
+            }
+        };
+        // Without a resolved conversation to attach under,
+        // `start_new_child_conversation` would lose the parent linkage. Drop
+        // and try again next cycle/event.
+        let Some(parent_conversation_id) = parent_conversation_id else {
             log::warn!(
                 "[orch-viewer] no active parent conversation for terminal_view_id={:?} \
                  parent_task_id={}; deferring child registration for task_id={task_id}",
@@ -428,6 +504,20 @@ impl OrchestrationViewerModel {
 
         // Arm the session_id refetch timer if the child arrived pre-claim.
         self.maybe_schedule_pending_session_id_poll(ctx);
+
+        // Descendants parked on this run can attach now.
+        self.drain_children_waiting_on(&task_id.to_string(), ctx);
+    }
+
+    /// Re-enters `register_child` for tasks parked on `parent_run_id` once
+    /// that run's placeholder exists.
+    fn drain_children_waiting_on(&mut self, parent_run_id: &str, ctx: &mut ModelContext<Self>) {
+        let Some(waiting) = self.children_waiting_on_parent.remove(parent_run_id) else {
+            return;
+        };
+        for task in waiting {
+            self.register_child(task, ctx);
+        }
     }
 
     // ---- Pending-session_id polling ----------------------------------
@@ -478,7 +568,7 @@ impl OrchestrationViewerModel {
         }
 
         for task_id in pending {
-            self.spawn_task_metadata_fetch(task_id, "PendingSessionIdPoll", ctx);
+            self.spawn_task_metadata_fetch(task_id, None, "PendingSessionIdPoll", ctx);
         }
 
         self.maybe_schedule_pending_session_id_poll(ctx);
