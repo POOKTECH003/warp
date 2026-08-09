@@ -76,6 +76,8 @@ fn make_run_event(event_type: &str, run_id: &str, ref_id: Option<&str>) -> Agent
         execution_id: None,
         occurred_at: "2026-01-01T00:00:00Z".to_string(),
         sequence: 1,
+        parent_run_id: None,
+        depth: None,
     }
 }
 
@@ -545,6 +547,8 @@ async fn dormant_claude_wake_consumer_stops_on_first_target_event() {
         execution_id: None,
         occurred_at: "2026-01-01T00:00:00Z".to_string(),
         sequence: 7,
+        parent_run_id: None,
+        depth: None,
     };
     assert_eq!(
         consumer.on_event(ignored_event).await.unwrap(),
@@ -559,6 +563,8 @@ async fn dormant_claude_wake_consumer_stops_on_first_target_event() {
         execution_id: None,
         occurred_at: "2026-01-01T00:00:00Z".to_string(),
         sequence: 7,
+        parent_run_id: None,
+        depth: None,
     };
     assert_eq!(
         consumer.on_event(ignored_same_run_lifecycle).await.unwrap(),
@@ -577,6 +583,8 @@ async fn dormant_claude_wake_consumer_stops_on_first_target_event() {
         execution_id: None,
         occurred_at: "2026-01-01T00:00:01Z".to_string(),
         sequence: 8,
+        parent_run_id: None,
+        depth: None,
     };
     assert_eq!(
         consumer.on_event(target_event).await.unwrap(),
@@ -792,6 +800,8 @@ fn handle_event_batch_persists_max_seq_to_history_model() {
                 execution_id: None,
                 occurred_at: "2026-01-01T00:00:00Z".to_string(),
                 sequence: 17,
+                parent_run_id: None,
+                depth: None,
             },
             AgentRunEvent {
                 event_type: "unrecognized_event_type".to_string(),
@@ -800,6 +810,8 @@ fn handle_event_batch_persists_max_seq_to_history_model() {
                 execution_id: None,
                 occurred_at: "2026-01-01T00:00:00Z".to_string(),
                 sequence: 42,
+                parent_run_id: None,
+                depth: None,
             },
         ];
 
@@ -880,6 +892,8 @@ fn handle_event_batch_drops_events_for_killed_run_ids_after_persisting_cursor() 
                         execution_id: None,
                         occurred_at: "2026-01-01T00:00:00Z".to_string(),
                         sequence: 17,
+                        parent_run_id: None,
+                        depth: None,
                     },
                     AgentRunEvent {
                         event_type: "run_cancelled".to_string(),
@@ -888,6 +902,8 @@ fn handle_event_batch_drops_events_for_killed_run_ids_after_persisting_cursor() 
                         execution_id: None,
                         occurred_at: "2026-01-01T00:00:01Z".to_string(),
                         sequence: 18,
+                        parent_run_id: None,
+                        depth: None,
                     },
                     AgentRunEvent {
                         event_type: "new_message".to_string(),
@@ -896,6 +912,8 @@ fn handle_event_batch_drops_events_for_killed_run_ids_after_persisting_cursor() 
                         execution_id: None,
                         occurred_at: "2026-01-01T00:00:02Z".to_string(),
                         sequence: 19,
+                        parent_run_id: None,
+                        depth: None,
                     },
                 ],
                 vec![
@@ -2734,6 +2752,868 @@ fn register_parent_on_wait_without_self_run_id_is_noop() {
         });
         poller.read(&app, |me, _| {
             assert!(connected_filter(me, conversation_id).is_none());
+        });
+    });
+}
+
+// ---- Root-scoped subtree streams and descendant placement ----------------
+
+const SUBTREE_ROOT_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440801";
+const SUBTREE_CHILD_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440802";
+const SUBTREE_GRANDCHILD_RUN_ID: &str = "550e8400-e29b-41d4-a716-446655440803";
+
+fn make_root_conversation(run_id: &str) -> AIConversation {
+    let mut conversation = AIConversation::new(false, false);
+    conversation.set_run_id(run_id.to_string());
+    conversation
+}
+
+fn make_remote_child_conversation(
+    run_id: &str,
+    parent_id: crate::ai::agent::conversation::AIConversationId,
+) -> AIConversation {
+    let mut conversation = AIConversation::new(false, false);
+    conversation.set_run_id(run_id.to_string());
+    conversation.set_parent_conversation_id(parent_id);
+    conversation.mark_as_remote_child();
+    conversation
+}
+
+fn make_descendant_task(
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    state: crate::ai::ambient_agents::AmbientAgentTaskState,
+    title: &str,
+) -> crate::ai::ambient_agents::AmbientAgentTask {
+    let mut task = make_ambient_task_with_task_id(run_id.parse().unwrap(), None);
+    task.parent_run_id = parent_run_id.map(str::to_string);
+    task.state = state;
+    task.title = title.to_string();
+    task
+}
+
+/// Builds a streamer whose mock tolerates the background task-metadata
+/// fetches spawned when a placeholder's run_id is assigned
+/// (`spawn_task_harness_fetch_if_needed`).
+fn streamer_with_permissive_task_fetch(
+    app: &mut warpui::App,
+) -> warpui::ModelHandle<OrchestrationEventStreamer> {
+    let mut mock = MockAIClient::new();
+    mock.expect_get_ambient_agent_task()
+        .returning(|task_id| Ok(make_ambient_task_with_task_id(*task_id, None)));
+    let ai_client: Arc<dyn AIClient> = Arc::new(mock);
+    let server_api = ServerApiProvider::new_for_test().get();
+    app.add_singleton_model(|ctx| {
+        OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+    })
+}
+
+#[test]
+fn root_parent_with_multi_level_flag_opens_subtree_stream() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let conversation = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let conversation_id = conversation.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+        });
+
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let poller = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        let consumer_id = warpui::EntityId::new();
+        poller.update(&mut app, |me, ctx| {
+            let stream = me.streams.entry(conversation_id).or_default();
+            stream.consumers.insert(consumer_id);
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_ROOT_RUN_ID.to_string());
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_CHILD_RUN_ID.to_string());
+            me.start_sse_connection(conversation_id, ctx);
+        });
+
+        poller.read(&app, |me, _| match connected_filter(me, conversation_id) {
+            Some(AgentEventFilter::SubtreeRootRunId { root_run_id }) => {
+                assert_eq!(root_run_id, SUBTREE_ROOT_RUN_ID);
+            }
+            other => panic!("expected SubtreeRootRunId filter, got {other:?}"),
+        });
+    });
+}
+
+#[test]
+fn mid_tree_parent_keeps_ancestor_stream_with_multi_level_flag() {
+    // Only tree roots may anchor a subtree stream; a parent that is itself a
+    // child stays on the direct-children ancestor scope.
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let mut conversation = make_root_conversation(SUBTREE_CHILD_RUN_ID);
+        conversation.set_parent_agent_id(SUBTREE_ROOT_RUN_ID.to_string());
+        let conversation_id = conversation.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+        });
+
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let poller = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        let consumer_id = warpui::EntityId::new();
+        poller.update(&mut app, |me, ctx| {
+            let stream = me.streams.entry(conversation_id).or_default();
+            stream.consumers.insert(consumer_id);
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_CHILD_RUN_ID.to_string());
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_GRANDCHILD_RUN_ID.to_string());
+            me.start_sse_connection(conversation_id, ctx);
+        });
+
+        poller.read(&app, |me, _| match connected_filter(me, conversation_id) {
+            Some(AgentEventFilter::AncestorRunId {
+                ancestor_run_id,
+                include_self,
+            }) => {
+                assert_eq!(ancestor_run_id, SUBTREE_CHILD_RUN_ID);
+                assert!(include_self);
+            }
+            other => panic!("expected AncestorRunId include_self filter, got {other:?}"),
+        });
+    });
+}
+
+#[test]
+fn root_parent_without_multi_level_flag_keeps_ancestor_stream() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(false);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let conversation = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let conversation_id = conversation.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+        });
+
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let poller = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        let consumer_id = warpui::EntityId::new();
+        poller.update(&mut app, |me, ctx| {
+            let stream = me.streams.entry(conversation_id).or_default();
+            stream.consumers.insert(consumer_id);
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_ROOT_RUN_ID.to_string());
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_CHILD_RUN_ID.to_string());
+            me.start_sse_connection(conversation_id, ctx);
+        });
+
+        poller.read(&app, |me, _| match connected_filter(me, conversation_id) {
+            Some(AgentEventFilter::AncestorRunId {
+                ancestor_run_id,
+                include_self,
+            }) => {
+                assert_eq!(ancestor_run_id, SUBTREE_ROOT_RUN_ID);
+                assert!(include_self);
+            }
+            other => panic!("expected AncestorRunId include_self filter, got {other:?}"),
+        });
+    });
+}
+
+#[test]
+fn subtree_filters_equivalent_only_for_matching_root() {
+    let a = AgentEventFilter::SubtreeRootRunId {
+        root_run_id: SUBTREE_ROOT_RUN_ID.to_string(),
+    };
+    let same = AgentEventFilter::SubtreeRootRunId {
+        root_run_id: SUBTREE_ROOT_RUN_ID.to_string(),
+    };
+    let different = AgentEventFilter::SubtreeRootRunId {
+        root_run_id: SUBTREE_CHILD_RUN_ID.to_string(),
+    };
+    let ancestor = AgentEventFilter::AncestorRunId {
+        ancestor_run_id: SUBTREE_ROOT_RUN_ID.to_string(),
+        include_self: true,
+    };
+
+    assert!(agent_event_filters_equivalent(&a, &same));
+    assert!(!agent_event_filters_equivalent(&a, &different));
+    assert!(!agent_event_filters_equivalent(&a, &ancestor));
+}
+
+/// Restores a tree root and gives its streamer entry the parent role.
+/// Returns the root's conversation id and its terminal surface id.
+fn setup_root_with_watched_child(
+    app: &mut warpui::App,
+    poller: &warpui::ModelHandle<OrchestrationEventStreamer>,
+    history_model: &warpui::ModelHandle<BlocklistAIHistoryModel>,
+) -> (
+    crate::ai::agent::conversation::AIConversationId,
+    warpui::EntityId,
+) {
+    let conversation = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+    let conversation_id = conversation.id();
+    let terminal_view_id = warpui::EntityId::new();
+    history_model.update(app, |model, ctx| {
+        model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+    });
+    poller.update(app, |me, _| {
+        let stream = me.streams.entry(conversation_id).or_default();
+        stream
+            .watched_run_ids
+            .insert(SUBTREE_ROOT_RUN_ID.to_string());
+        stream
+            .watched_run_ids
+            .insert(SUBTREE_CHILD_RUN_ID.to_string());
+    });
+    (conversation_id, terminal_view_id)
+}
+
+#[test]
+fn discovery_fetches_unknown_runs_on_root_streams() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let poller = streamer_with_permissive_task_fetch(&mut app);
+        let (conversation_id, _) = setup_root_with_watched_child(&mut app, &poller, &history_model);
+
+        let events = vec![make_run_event(
+            "run_in_progress",
+            SUBTREE_GRANDCHILD_RUN_ID,
+            None,
+        )];
+        poller.update(&mut app, |me, ctx| {
+            me.discover_unknown_descendants(conversation_id, SUBTREE_ROOT_RUN_ID, &events, ctx);
+        });
+
+        poller.read(&app, |me, _| {
+            assert!(
+                me.descendant_discovery_in_flight
+                    .contains(SUBTREE_GRANDCHILD_RUN_ID),
+                "an unknown descendant run must trigger a task fetch"
+            );
+        });
+    });
+}
+
+#[test]
+fn discovery_skips_runs_already_known_locally() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let child = make_remote_child_conversation(SUBTREE_CHILD_RUN_ID, root_id);
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root, child], ctx);
+        });
+
+        let poller = streamer_with_no_fetch_expected(&mut app);
+        poller.update(&mut app, |me, _| {
+            let stream = me.streams.entry(root_id).or_default();
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_ROOT_RUN_ID.to_string());
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_CHILD_RUN_ID.to_string());
+        });
+
+        let events = vec![make_run_event(
+            "run_in_progress",
+            SUBTREE_CHILD_RUN_ID,
+            None,
+        )];
+        poller.update(&mut app, |me, ctx| {
+            me.discover_unknown_descendants(root_id, SUBTREE_ROOT_RUN_ID, &events, ctx);
+        });
+
+        poller.read(&app, |me, _| {
+            assert!(
+                me.descendant_discovery_in_flight.is_empty(),
+                "runs already indexed locally must not be re-fetched"
+            );
+        });
+    });
+}
+
+#[test]
+fn discovery_skips_killed_runs() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let poller = streamer_with_no_fetch_expected(&mut app);
+        let (conversation_id, _) = setup_root_with_watched_child(&mut app, &poller, &history_model);
+
+        let events = vec![make_run_event(
+            "run_in_progress",
+            SUBTREE_GRANDCHILD_RUN_ID,
+            None,
+        )];
+        poller.update(&mut app, |me, ctx| {
+            me.remember_killed_run_id(SUBTREE_GRANDCHILD_RUN_ID.to_string());
+            me.discover_unknown_descendants(conversation_id, SUBTREE_ROOT_RUN_ID, &events, ctx);
+        });
+
+        poller.read(&app, |me, _| {
+            assert!(me.descendant_discovery_in_flight.is_empty());
+        });
+    });
+}
+
+#[test]
+fn discovery_only_runs_for_tree_roots() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        // A mid-tree owner: it has the parent role but is itself a child.
+        let mut conversation = make_root_conversation(SUBTREE_CHILD_RUN_ID);
+        conversation.set_parent_agent_id(SUBTREE_ROOT_RUN_ID.to_string());
+        let conversation_id = conversation.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+        });
+
+        let poller = streamer_with_no_fetch_expected(&mut app);
+        poller.update(&mut app, |me, _| {
+            let stream = me.streams.entry(conversation_id).or_default();
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_CHILD_RUN_ID.to_string());
+            stream
+                .watched_run_ids
+                .insert(SUBTREE_GRANDCHILD_RUN_ID.to_string());
+        });
+
+        let unknown_run = "550e8400-e29b-41d4-a716-446655440899";
+        let events = vec![make_run_event("run_in_progress", unknown_run, None)];
+        poller.update(&mut app, |me, ctx| {
+            me.discover_unknown_descendants(conversation_id, SUBTREE_CHILD_RUN_ID, &events, ctx);
+        });
+
+        poller.read(&app, |me, _| {
+            assert!(
+                me.descendant_discovery_in_flight.is_empty(),
+                "mid-tree owners must not place descendants"
+            );
+        });
+    });
+}
+
+#[test]
+fn place_discovered_descendant_creates_nested_remote_placeholder() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+        crate::test_util::settings::initialize_history_persistence_for_tests(&mut app);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let child = make_remote_child_conversation(SUBTREE_CHILD_RUN_ID, root_id);
+        let child_id = child.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root, child], ctx);
+        });
+
+        let poller = streamer_with_permissive_task_fetch(&mut app);
+
+        let task = make_descendant_task(
+            SUBTREE_GRANDCHILD_RUN_ID,
+            Some(SUBTREE_CHILD_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Grandchild worker",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.place_discovered_descendant(root_id, task, 0, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            let grandchild_id = model
+                .conversation_id_for_agent_id(SUBTREE_GRANDCHILD_RUN_ID)
+                .expect("grandchild run must be indexed");
+            let conversation = model
+                .conversation(&grandchild_id)
+                .expect("grandchild conversation must be loaded");
+            assert!(conversation.is_remote_child());
+            assert_eq!(
+                conversation.task_id().map(|id| id.to_string()),
+                Some(SUBTREE_GRANDCHILD_RUN_ID.to_string())
+            );
+            assert_eq!(
+                model.resolved_parent_conversation_id_for_conversation(conversation),
+                Some(child_id),
+                "grandchild must attach under the mid-tree remote child"
+            );
+            assert!(
+                model
+                    .child_conversation_ids_of(&child_id)
+                    .contains(&grandchild_id),
+                "grandchild must be registered in the parent \u{2192} children index"
+            );
+            assert_eq!(conversation.status(), &ConversationStatus::InProgress);
+            assert_eq!(conversation.title().as_deref(), Some("Grandchild worker"));
+        });
+    });
+}
+
+#[test]
+fn place_discovered_descendant_dedupes_runs_registered_meanwhile() {
+    // A `run_agents` spawn can register the same run while the discovery
+    // fetch is in flight; placement must not create a duplicate conversation.
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let child = make_remote_child_conversation(SUBTREE_CHILD_RUN_ID, root_id);
+        let child_id = child.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root, child], ctx);
+        });
+
+        let poller = streamer_with_no_fetch_expected(&mut app);
+
+        let task = make_descendant_task(
+            SUBTREE_CHILD_RUN_ID,
+            Some(SUBTREE_ROOT_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Already registered",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.place_discovered_descendant(root_id, task, 0, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            assert_eq!(
+                model.conversation_id_for_agent_id(SUBTREE_CHILD_RUN_ID),
+                Some(child_id),
+                "the pre-registered conversation must keep owning the run"
+            );
+            assert_eq!(
+                model.child_conversation_ids_of(&root_id),
+                &[child_id],
+                "no duplicate placeholder may be created for a known run"
+            );
+        });
+    });
+}
+
+#[test]
+fn place_discovered_descendant_walks_unknown_parents_then_drains() {
+    // Out-of-band chains: a grandchild arrives before its parent is known.
+    // The task parks on the parent run; once the parent's task is placed the
+    // parked grandchild drains under it.
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+        crate::test_util::settings::initialize_history_persistence_for_tests(&mut app);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root], ctx);
+        });
+
+        let poller = streamer_with_permissive_task_fetch(&mut app);
+
+        let grandchild_task = make_descendant_task(
+            SUBTREE_GRANDCHILD_RUN_ID,
+            Some(SUBTREE_CHILD_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Grandchild",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.place_discovered_descendant(root_id, grandchild_task, 0, ctx);
+        });
+
+        poller.read(&app, |me, _| {
+            assert_eq!(
+                me.descendant_tasks_waiting_on_parent
+                    .get(SUBTREE_CHILD_RUN_ID)
+                    .map(|tasks| tasks.len()),
+                Some(1),
+                "the grandchild must park until its parent is placed"
+            );
+        });
+
+        // Simulate the parent walk fetch completing.
+        let child_task = make_descendant_task(
+            SUBTREE_CHILD_RUN_ID,
+            Some(SUBTREE_ROOT_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Child",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.place_discovered_descendant(root_id, child_task, 1, ctx);
+        });
+
+        poller.read(&app, |me, _| {
+            assert!(me.descendant_tasks_waiting_on_parent.is_empty());
+        });
+        history_model.read(&app, |model, _| {
+            let child_id = model
+                .conversation_id_for_agent_id(SUBTREE_CHILD_RUN_ID)
+                .expect("intermediate placeholder must exist");
+            let grandchild_id = model
+                .conversation_id_for_agent_id(SUBTREE_GRANDCHILD_RUN_ID)
+                .expect("parked grandchild must drain once the parent lands");
+            assert!(
+                model
+                    .child_conversation_ids_of(&root_id)
+                    .contains(&child_id)
+            );
+            assert!(
+                model
+                    .child_conversation_ids_of(&child_id)
+                    .contains(&grandchild_id)
+            );
+        });
+    });
+}
+
+#[test]
+fn place_discovered_descendant_respects_killed_tombstones() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root], ctx);
+        });
+
+        let poller = streamer_with_no_fetch_expected(&mut app);
+
+        let task = make_descendant_task(
+            SUBTREE_GRANDCHILD_RUN_ID,
+            Some(SUBTREE_ROOT_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Killed grandchild",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.remember_killed_run_id(SUBTREE_GRANDCHILD_RUN_ID.to_string());
+            me.place_discovered_descendant(root_id, task, 0, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            assert_eq!(
+                model.conversation_id_for_agent_id(SUBTREE_GRANDCHILD_RUN_ID),
+                None,
+                "killed runs must never be resurrected as placeholders"
+            );
+        });
+    });
+}
+
+fn make_lifecycle_event(event_type: &str, run_id: &str, sequence: i64) -> AgentRunEvent {
+    AgentRunEvent {
+        event_type: event_type.to_string(),
+        run_id: run_id.to_string(),
+        ref_id: None,
+        execution_id: None,
+        occurred_at: "2026-01-01T00:00:00Z".to_string(),
+        sequence,
+        parent_run_id: None,
+        depth: None,
+    }
+}
+
+/// Restores a root -> remote child -> remote grandchild chain and returns
+/// (root_id, child_id, grandchild_id, terminal_view_id).
+fn restore_three_level_tree(
+    app: &mut warpui::App,
+    history_model: &warpui::ModelHandle<BlocklistAIHistoryModel>,
+) -> (
+    crate::ai::agent::conversation::AIConversationId,
+    crate::ai::agent::conversation::AIConversationId,
+    crate::ai::agent::conversation::AIConversationId,
+    warpui::EntityId,
+) {
+    let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+    let root_id = root.id();
+    let child = make_remote_child_conversation(SUBTREE_CHILD_RUN_ID, root_id);
+    let child_id = child.id();
+    let grandchild = make_remote_child_conversation(SUBTREE_GRANDCHILD_RUN_ID, child_id);
+    let grandchild_id = grandchild.id();
+    let terminal_view_id = warpui::EntityId::new();
+    history_model.update(app, |model, ctx| {
+        model.restore_conversations(terminal_view_id, vec![root, child, grandchild], ctx);
+    });
+    (root_id, child_id, grandchild_id, terminal_view_id)
+}
+
+#[test]
+fn descendant_lifecycle_routing_updates_grandchild_placeholder_status() {
+    App::test((), |mut app| async move {
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let (root_id, _, grandchild_id, _) = restore_three_level_tree(&mut app, &history_model);
+
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let poller = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        let events = vec![make_lifecycle_event(
+            "run_succeeded",
+            SUBTREE_GRANDCHILD_RUN_ID,
+            10,
+        )];
+        poller.update(&mut app, |me, ctx| {
+            me.route_descendant_lifecycle_statuses(root_id, SUBTREE_ROOT_RUN_ID, &events, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            assert_eq!(
+                model.conversation_status(&grandchild_id),
+                Some(&ConversationStatus::Success)
+            );
+        });
+    });
+}
+
+#[test]
+fn descendant_lifecycle_routing_ignores_replayed_older_events() {
+    App::test((), |mut app| async move {
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let (root_id, _, grandchild_id, _) = restore_three_level_tree(&mut app, &history_model);
+
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let poller = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        poller.update(&mut app, |me, ctx| {
+            me.route_descendant_lifecycle_statuses(
+                root_id,
+                SUBTREE_ROOT_RUN_ID,
+                &[make_lifecycle_event(
+                    "run_succeeded",
+                    SUBTREE_GRANDCHILD_RUN_ID,
+                    10,
+                )],
+                ctx,
+            );
+            // An SSE reconnect can replay an older transition; it must not
+            // regress the placeholder's terminal status.
+            me.route_descendant_lifecycle_statuses(
+                root_id,
+                SUBTREE_ROOT_RUN_ID,
+                &[make_lifecycle_event(
+                    "run_in_progress",
+                    SUBTREE_GRANDCHILD_RUN_ID,
+                    5,
+                )],
+                ctx,
+            );
+        });
+
+        history_model.read(&app, |model, _| {
+            assert_eq!(
+                model.conversation_status(&grandchild_id),
+                Some(&ConversationStatus::Success),
+                "a replayed older event must not regress the status"
+            );
+        });
+    });
+}
+
+#[test]
+fn descendant_lifecycle_routing_leaves_direct_children_alone() {
+    // Direct children keep their existing status paths
+    // (`WatchedRunStatusChanged` consumers / the hidden child pane).
+    App::test((), |mut app| async move {
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let (root_id, child_id, _, terminal_view_id) =
+            restore_three_level_tree(&mut app, &history_model);
+        history_model.update(&mut app, |model, ctx| {
+            model.update_conversation_status(
+                terminal_view_id,
+                child_id,
+                ConversationStatus::InProgress,
+                ctx,
+            );
+        });
+
+        let ai_client: Arc<dyn AIClient> = Arc::new(MockAIClient::new());
+        let server_api = ServerApiProvider::new_for_test().get();
+        let poller = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        let events = vec![make_lifecycle_event(
+            "run_cancelled",
+            SUBTREE_CHILD_RUN_ID,
+            10,
+        )];
+        poller.update(&mut app, |me, ctx| {
+            me.route_descendant_lifecycle_statuses(root_id, SUBTREE_ROOT_RUN_ID, &events, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            assert_eq!(
+                model.conversation_status(&child_id),
+                Some(&ConversationStatus::InProgress),
+                "direct-child statuses are owned by their existing update paths"
+            );
+        });
+    });
+}
+
+#[test]
+fn subtree_restore_seed_places_descendants_in_dependency_order() {
+    // The seed response is unordered: a grandchild can precede its parent.
+    // Multi-pass placement must still attach both correctly, and the cursor
+    // must not advance from descendant rows.
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+        crate::test_util::settings::initialize_history_persistence_for_tests(&mut app);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root], ctx);
+        });
+
+        let poller = streamer_with_permissive_task_fetch(&mut app);
+        poller.update(&mut app, |me, _| {
+            me.streams.entry(root_id).or_default().event_cursor = 7;
+        });
+
+        let mut grandchild_task = make_descendant_task(
+            SUBTREE_GRANDCHILD_RUN_ID,
+            Some(SUBTREE_CHILD_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Grandchild",
+        );
+        grandchild_task.last_event_sequence = Some(99);
+        let child_task = make_descendant_task(
+            SUBTREE_CHILD_RUN_ID,
+            Some(SUBTREE_ROOT_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::Succeeded,
+            "Child",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.finish_subtree_restore_seed(root_id, vec![grandchild_task, child_task], ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            let child_id = model
+                .conversation_id_for_agent_id(SUBTREE_CHILD_RUN_ID)
+                .expect("child placeholder must be rebuilt");
+            let grandchild_id = model
+                .conversation_id_for_agent_id(SUBTREE_GRANDCHILD_RUN_ID)
+                .expect("grandchild placeholder must be rebuilt");
+            assert!(
+                model
+                    .child_conversation_ids_of(&root_id)
+                    .contains(&child_id)
+            );
+            assert!(
+                model
+                    .child_conversation_ids_of(&child_id)
+                    .contains(&grandchild_id)
+            );
+        });
+        poller.read(&app, |me, _| {
+            assert_eq!(
+                me.streams.get(&root_id).map(|s| s.event_cursor),
+                Some(7),
+                "descendant cursors must not advance the root's replay cursor"
+            );
+        });
+    });
+}
+
+#[test]
+fn subtree_restore_seed_skips_runs_already_known_locally() {
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let child = make_remote_child_conversation(SUBTREE_CHILD_RUN_ID, root_id);
+        let child_id = child.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root, child], ctx);
+        });
+
+        let poller = streamer_with_no_fetch_expected(&mut app);
+        poller.update(&mut app, |me, _| {
+            me.streams.entry(root_id).or_default();
+        });
+
+        let child_task = make_descendant_task(
+            SUBTREE_CHILD_RUN_ID,
+            Some(SUBTREE_ROOT_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Child",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.finish_subtree_restore_seed(root_id, vec![child_task], ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            assert_eq!(
+                model.child_conversation_ids_of(&root_id),
+                &[child_id],
+                "seeding must not duplicate restored placeholders"
+            );
         });
     });
 }

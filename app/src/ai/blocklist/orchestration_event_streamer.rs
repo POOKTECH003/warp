@@ -25,7 +25,7 @@ use crate::ai::agent_events::{
     AgentEventConsumer, AgentEventConsumerControlFlow, AgentEventDriverConfig, AgentEventFilter,
     AgentMessageEventMetadata, MessageHydrator, ServerApiAgentEventSource, run_agent_event_driver,
 };
-use crate::ai::ambient_agents::AmbientAgentTaskId;
+use crate::ai::ambient_agents::{AmbientAgentTask, AmbientAgentTaskId, AmbientAgentTaskState};
 use crate::server::retry_strategies::is_transient_http_error;
 use crate::server::server_api::ai::{AIClient, AgentRunEvent, TaskListFilter};
 use crate::server::server_api::{ServerApi, ServerApiProvider};
@@ -45,6 +45,13 @@ const MAX_KILLED_RUN_IDS: usize = 1024;
 /// viewer mode. Matches the legacy `OrchestrationViewerModel` poller's value
 /// (the server caps at 100 anyway).
 const VIEWER_MODE_SEED_FETCH_LIMIT: i32 = 100;
+/// Max descendant runs fetched per cold-start `?root_run_id=` REST seed for
+/// an owner-side tree root (the server caps at 100 anyway).
+const SUBTREE_SEED_FETCH_LIMIT: i32 = 100;
+/// Cap on how many `parent_run_id` links descendant discovery walks up when
+/// placing a run whose ancestors are unknown locally (out-of-band chains).
+/// Generously above the server's orchestration depth limit.
+const MAX_DESCENDANT_DISCOVERY_WALK_DEPTH: usize = 16;
 
 /// Per-event item delivered from the SSE background task to the entity.
 struct SseStreamItem {
@@ -226,6 +233,9 @@ struct ConversationStreamState {
     /// Consecutive `get_ambient_agent_task` failure count for the
     /// post-restore retry loop; resets on success.
     restore_fetch_failures: usize,
+    /// Consecutive failure count for the post-restore subtree seed fetch
+    /// (`?root_run_id=` list); resets on success.
+    subtree_seed_failures: usize,
 }
 
 /// Per-orchestrator SSE stream state. Parallels [`ConversationStreamState`]
@@ -294,6 +304,17 @@ pub struct OrchestrationEventStreamer {
     /// Run IDs killed locally; kept briefly to drop late server events.
     killed_run_ids: HashSet<String>,
     killed_run_id_order: VecDeque<String>,
+    /// Run IDs with an in-flight descendant-discovery task fetch, so one
+    /// unknown run observed across several drained batches only fetches once.
+    descendant_discovery_in_flight: HashSet<String>,
+    /// Discovered descendant tasks parked until their parent run's placeholder
+    /// exists, keyed by the parent run_id being resolved.
+    descendant_tasks_waiting_on_parent: HashMap<String, Vec<AmbientAgentTask>>,
+    /// Highest lifecycle event sequence applied to each descendant
+    /// placeholder's status, keyed by run_id. Makes replayed events (SSE
+    /// reconnect from an older cursor) idempotent: an event at or below the
+    /// recorded sequence never regresses a placeholder's status.
+    descendant_status_sequences: HashMap<String, i64>,
 }
 
 #[allow(private_interfaces)]
@@ -435,6 +456,9 @@ impl OrchestrationEventStreamer {
             next_wake_generation: 0,
             killed_run_ids: HashSet::new(),
             killed_run_id_order: VecDeque::new(),
+            descendant_discovery_in_flight: HashSet::new(),
+            descendant_tasks_waiting_on_parent: HashMap::new(),
+            descendant_status_sequences: HashMap::new(),
         }
     }
 
@@ -460,6 +484,9 @@ impl OrchestrationEventStreamer {
             next_wake_generation: 0,
             killed_run_ids: HashSet::new(),
             killed_run_id_order: VecDeque::new(),
+            descendant_discovery_in_flight: HashSet::new(),
+            descendant_tasks_waiting_on_parent: HashMap::new(),
+            descendant_status_sequences: HashMap::new(),
         }
     }
 
@@ -1340,6 +1367,8 @@ impl OrchestrationEventStreamer {
         }
 
         if let Some(run_id) = removed_run_id.as_deref() {
+            self.descendant_status_sequences.remove(run_id);
+            self.descendant_tasks_waiting_on_parent.remove(run_id);
             let mut affected = Vec::new();
             for (other_id, stream) in self.streams.iter_mut() {
                 if stream.watched_run_ids.remove(run_id) {
@@ -1473,6 +1502,7 @@ impl OrchestrationEventStreamer {
                 // SQLite value so already-acknowledged events aren't replayed.
                 self.apply_task_children(conv_id, &task, sqlite_cursor);
                 self.reevaluate_eligibility(conv_id, ctx);
+                self.spawn_subtree_restore_seed_if_root(conv_id, &task, ctx);
             }
             Err(err) => {
                 // If the conversation was removed mid-flight, drop the
@@ -1553,6 +1583,167 @@ impl OrchestrationEventStreamer {
         stream.event_cursor = base_cursor.max(server_seq);
         for child in &task.children {
             stream.watched_run_ids.insert(child.clone());
+        }
+    }
+
+    /// After the post-restore fetch of a tree root's own task, seeds
+    /// placeholders for its whole descendant subtree via the `root_run_id`
+    /// list filter, so descendants spawned by remote children survive
+    /// restarts.
+    ///
+    /// The event cursor is deliberately NOT advanced from descendant rows:
+    /// a descendant's `last_event_sequence` reflects that run's own
+    /// processing progress in the shared sequence space, and folding it in
+    /// could skip root-addressed events on replay. The cursor stays
+    /// `max(local SQLite, root task's server cursor)` per
+    /// [`Self::apply_task_children`].
+    fn spawn_subtree_restore_seed_if_root(
+        &mut self,
+        conv_id: AIConversationId,
+        task: &AmbientAgentTask,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !FeatureFlag::MultiLevelOrchestration.is_enabled() {
+            return;
+        }
+        // Only tree roots (no parent run) with children need whole-subtree
+        // seeding; mid-tree conversations keep direct-children semantics.
+        if task.parent_run_id.is_some() || task.children.is_empty() {
+            return;
+        }
+        // Passive views of runs hosted elsewhere never own placement.
+        if self.is_remote_run_view(conv_id, ctx) {
+            return;
+        }
+        self.spawn_subtree_seed_fetch(conv_id, task.task_id, ctx);
+    }
+
+    /// Issues the `?root_run_id=` descendant list fetch for a tree root and
+    /// routes the result through [`Self::finish_subtree_restore_seed`]. On
+    /// failure (including 403/404 anchor validation from the server),
+    /// schedules a retry with the same backoff policy as the post-restore
+    /// task fetch; live subtree discovery still backfills in the meantime.
+    fn spawn_subtree_seed_fetch(
+        &mut self,
+        conv_id: AIConversationId,
+        root_task_id: AmbientAgentTaskId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let filter = TaskListFilter {
+            root_run_id: Some(root_task_id.to_string()),
+            ..TaskListFilter::default()
+        };
+        let ai_client = self.ai_client.clone();
+        ctx.spawn(
+            async move {
+                ai_client
+                    .list_ambient_agent_tasks(SUBTREE_SEED_FETCH_LIMIT, filter)
+                    .await
+            },
+            move |me, result, ctx| match result {
+                Ok(tasks) => {
+                    if let Some(stream) = me.streams.get_mut(&conv_id) {
+                        stream.subtree_seed_failures = 0;
+                    }
+                    me.finish_subtree_restore_seed(conv_id, tasks, ctx);
+                }
+                Err(err) => {
+                    // Conversation removed mid-flight: drop the retry.
+                    if !me.streams.contains_key(&conv_id) {
+                        return;
+                    }
+                    log::warn!(
+                        "[orch-subtree] restore seed fetch failed for {conv_id:?}: {err:#}; \
+                         will retry (live subtree discovery backfills meanwhile)"
+                    );
+                    let backoff_steps = if is_transient_http_error(&err) {
+                        RESTORE_FETCH_BACKOFF_STEPS
+                    } else {
+                        RESTORE_FETCH_PERMANENT_BACKOFF_STEPS
+                    };
+                    let stream = me.streams.entry(conv_id).or_default();
+                    stream.subtree_seed_failures += 1;
+                    let step_index = stream
+                        .subtree_seed_failures
+                        .saturating_sub(1)
+                        .min(backoff_steps.len() - 1);
+                    let backoff = Duration::from_secs(backoff_steps[step_index]);
+                    ctx.spawn(
+                        async move { Timer::after(backoff).await },
+                        move |me, _, ctx| {
+                            if !me.streams.contains_key(&conv_id) {
+                                return;
+                            }
+                            me.spawn_subtree_seed_fetch(conv_id, root_task_id, ctx);
+                        },
+                    );
+                }
+            },
+        );
+    }
+
+    /// Applies a cold-start subtree seed: rebuilds remote placeholders for
+    /// descendants missing from local history. Parents are resolved in
+    /// passes so deeper nodes can attach to placeholders created earlier in
+    /// the same batch; leftovers fall back to the walk-up discovery path.
+    fn finish_subtree_restore_seed(
+        &mut self,
+        conv_id: AIConversationId,
+        tasks: Vec<AmbientAgentTask>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        // Conversation removed while the fetch was in flight.
+        if !self.streams.contains_key(&conv_id) {
+            return;
+        }
+        let root_run_id = self.self_run_id(conv_id, ctx);
+        let mut remaining: Vec<AmbientAgentTask> = Vec::new();
+        for task in tasks {
+            let run_id = task.task_id.to_string();
+            // The filter returns descendants only, but skip the root
+            // defensively, along with killed and already-known runs.
+            if Some(&run_id) == root_run_id.as_ref() || self.killed_run_ids.contains(&run_id) {
+                continue;
+            }
+            if BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation_id_for_agent_id(&run_id)
+                .is_some()
+            {
+                continue;
+            }
+            remaining.push(task);
+        }
+
+        loop {
+            let mut next_remaining = Vec::with_capacity(remaining.len());
+            let mut progressed = false;
+            for task in remaining {
+                let parent_conversation_id = task.parent_run_id.as_deref().and_then(|parent| {
+                    BlocklistAIHistoryModel::as_ref(ctx).conversation_id_for_agent_id(parent)
+                });
+                match parent_conversation_id {
+                    Some(parent_conversation_id) => {
+                        self.create_descendant_placeholder(
+                            conv_id,
+                            parent_conversation_id,
+                            &task,
+                            ctx,
+                        );
+                        progressed = true;
+                    }
+                    None => next_remaining.push(task),
+                }
+            }
+            remaining = next_remaining;
+            if !progressed || remaining.is_empty() {
+                break;
+            }
+        }
+
+        // Whatever is left references an ancestor outside the seed batch
+        // (out-of-band chains); resolve it through the walk-up path.
+        for task in remaining {
+            self.place_discovered_descendant(conv_id, task, 0, ctx);
         }
     }
 
@@ -1681,6 +1872,20 @@ impl OrchestrationEventStreamer {
             .unwrap_or_default()
     }
 
+    /// Tree root: holds the parent role without being anyone's child. Only
+    /// roots may anchor the subtree stream (the server rejects mid-tree
+    /// anchors) and only roots own whole-subtree placeholder placement.
+    fn is_tree_root_parent(
+        &self,
+        conversation_id: AIConversationId,
+        ctx: &warpui::AppContext,
+    ) -> bool {
+        self.is_parent_agent_conversation(conversation_id, ctx)
+            && !BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation(&conversation_id)
+                .is_some_and(|c| c.is_child_agent_conversation())
+    }
+
     /// Selects the owner-side event stream filter for a conversation.
     fn desired_sse_filter(
         &self,
@@ -1693,10 +1898,25 @@ impl OrchestrationEventStreamer {
             // be created). Return NoFilter defensively if it's absent so
             // `on_server_token_assigned` re-evaluates when the token arrives.
             return match self.self_run_id(conversation_id, ctx) {
-                Some(self_run_id) => DesiredSseFilter::Filter(AgentEventFilter::AncestorRunId {
-                    ancestor_run_id: self_run_id,
-                    include_self: true,
-                }),
+                Some(self_run_id) => {
+                    // A tree root watches its whole subtree so runs spawned
+                    // by remote children are observed; mid-tree parents keep
+                    // the direct-children ancestor scope (the subtree key
+                    // only exists at the root).
+                    let filter = if FeatureFlag::MultiLevelOrchestration.is_enabled()
+                        && self.is_tree_root_parent(conversation_id, ctx)
+                    {
+                        AgentEventFilter::SubtreeRootRunId {
+                            root_run_id: self_run_id,
+                        }
+                    } else {
+                        AgentEventFilter::AncestorRunId {
+                            ancestor_run_id: self_run_id,
+                            include_self: true,
+                        }
+                    };
+                    DesiredSseFilter::Filter(filter)
+                }
                 None => {
                     log::warn!(
                         "Parent conversation {conversation_id:?} has watched children \
@@ -2108,6 +2328,13 @@ impl OrchestrationEventStreamer {
                 .extend(message_ids);
         }
 
+        // A tree root's subtree stream can deliver events for runs this
+        // process never spawned (grandchildren started by remote children,
+        // out-of-band descendants). Materialize placeholders for them and
+        // route their lifecycle onto existing descendant placeholders.
+        self.discover_unknown_descendants(conversation_id, self_run_id, &events, ctx);
+        self.route_descendant_lifecycle_statuses(conversation_id, self_run_id, &events, ctx);
+
         // The owner-side event service delivers lifecycle notifications to the
         // orchestrator conversation, but passive remote-child views do not run
         // their own SSE stream. Broadcast the same canonical status mapping so
@@ -2136,6 +2363,312 @@ impl OrchestrationEventStreamer {
         OrchestrationEventService::handle(ctx).update(ctx, |svc, ctx| {
             svc.enqueue_event_batch(conversation_id, pending, ctx);
         });
+    }
+
+    // ---- Descendant discovery and placement (subtree streams) ---------
+
+    /// Kicks off placeholder discovery for events on a tree root's subtree
+    /// stream whose run is unknown locally. Only roots own placement:
+    /// mid-tree parents keep direct-children scope and their existing
+    /// semantics unchanged.
+    fn discover_unknown_descendants(
+        &mut self,
+        owner_conversation_id: AIConversationId,
+        self_run_id: &str,
+        events: &[AgentRunEvent],
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !FeatureFlag::MultiLevelOrchestration.is_enabled()
+            || !self.is_tree_root_parent(owner_conversation_id, ctx)
+        {
+            return;
+        }
+        let mut seen_in_batch = HashSet::new();
+        for event in events {
+            let run_id = event.run_id.as_str();
+            if run_id == self_run_id
+                || self.killed_run_ids.contains(run_id)
+                || !seen_in_batch.insert(run_id)
+            {
+                continue;
+            }
+            if BlocklistAIHistoryModel::as_ref(ctx)
+                .conversation_id_for_agent_id(run_id)
+                .is_some()
+            {
+                continue;
+            }
+            self.spawn_descendant_task_fetch(owner_conversation_id, run_id.to_string(), 0, ctx);
+        }
+    }
+
+    /// Fetches a discovered run's task row for placement. The fetch also
+    /// closes most of the race with an in-flight `run_agents` spawn:
+    /// placement re-checks the run_id index when the response lands, so a
+    /// child registered by its spawn path in the meantime is not duplicated.
+    /// A failed fetch drops silently — the next event for the run retries.
+    fn spawn_descendant_task_fetch(
+        &mut self,
+        owner_conversation_id: AIConversationId,
+        run_id: String,
+        walk_depth: usize,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if walk_depth > MAX_DESCENDANT_DISCOVERY_WALK_DEPTH {
+            log::warn!(
+                "[orch-subtree] abandoning descendant discovery at run {run_id}: \
+                 parent walk exceeded {MAX_DESCENDANT_DISCOVERY_WALK_DEPTH} levels"
+            );
+            self.descendant_tasks_waiting_on_parent.remove(&run_id);
+            return;
+        }
+        let Ok(task_id) = run_id.parse::<AmbientAgentTaskId>() else {
+            self.descendant_tasks_waiting_on_parent.remove(&run_id);
+            return;
+        };
+        if !self.descendant_discovery_in_flight.insert(run_id.clone()) {
+            return;
+        }
+        let ai_client = self.ai_client.clone();
+        ctx.spawn(
+            async move { ai_client.get_ambient_agent_task(&task_id).await },
+            move |me, result, ctx| {
+                me.descendant_discovery_in_flight.remove(&run_id);
+                match result {
+                    Ok(task) => {
+                        me.place_discovered_descendant(
+                            owner_conversation_id,
+                            task,
+                            walk_depth,
+                            ctx,
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[orch-subtree] descendant discovery fetch failed for run \
+                             {run_id}: {err:#}; dropping (a later event retries)"
+                        );
+                        me.descendant_tasks_waiting_on_parent.remove(&run_id);
+                    }
+                }
+            },
+        );
+    }
+
+    /// Places a fetched descendant task under its parent's conversation as a
+    /// remote placeholder. When the parent run is itself unknown locally
+    /// (out-of-band chains), the task is parked and the walk continues one
+    /// `parent_run_id` link up; parked tasks drain once their parent's
+    /// placeholder lands.
+    fn place_discovered_descendant(
+        &mut self,
+        owner_conversation_id: AIConversationId,
+        task: AmbientAgentTask,
+        walk_depth: usize,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let run_id = task.task_id.to_string();
+        if self.killed_run_ids.contains(&run_id) {
+            return;
+        }
+        // Re-check the index: a `run_agents` spawn (or a concurrent placement)
+        // may have registered this run while the fetch was in flight.
+        if BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation_id_for_agent_id(&run_id)
+            .is_some()
+        {
+            self.place_tasks_waiting_on_parent(owner_conversation_id, &run_id, ctx);
+            return;
+        }
+        let Some(parent_run_id) = task.parent_run_id.clone() else {
+            log::warn!(
+                "[orch-subtree] discovered run {run_id} has no parent_run_id; \
+                 not a descendant, dropping"
+            );
+            return;
+        };
+        let parent_conversation_id =
+            BlocklistAIHistoryModel::as_ref(ctx).conversation_id_for_agent_id(&parent_run_id);
+        match parent_conversation_id {
+            Some(parent_conversation_id) => {
+                let placed = self
+                    .create_descendant_placeholder(
+                        owner_conversation_id,
+                        parent_conversation_id,
+                        &task,
+                        ctx,
+                    )
+                    .is_some();
+                if placed {
+                    self.place_tasks_waiting_on_parent(owner_conversation_id, &run_id, ctx);
+                }
+            }
+            None => {
+                self.descendant_tasks_waiting_on_parent
+                    .entry(parent_run_id.clone())
+                    .or_default()
+                    .push(task);
+                self.spawn_descendant_task_fetch(
+                    owner_conversation_id,
+                    parent_run_id,
+                    walk_depth + 1,
+                    ctx,
+                );
+            }
+        }
+    }
+
+    /// Drains tasks parked on `parent_run_id` once that run's conversation
+    /// exists, re-entering the placement path for each.
+    fn place_tasks_waiting_on_parent(
+        &mut self,
+        owner_conversation_id: AIConversationId,
+        parent_run_id: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(waiting) = self
+            .descendant_tasks_waiting_on_parent
+            .remove(parent_run_id)
+        else {
+            return;
+        };
+        for task in waiting {
+            self.place_discovered_descendant(owner_conversation_id, task, 0, ctx);
+        }
+    }
+
+    /// Creates a remote-child placeholder conversation for `task` under
+    /// `parent_conversation_id`, mirroring the placeholder shape produced by
+    /// `run_agents` remote-child launches: linked through the history
+    /// model's parent → children index, marked remote, indexed by run_id,
+    /// and carrying display metadata + status from the fetched task. The
+    /// hidden pane materializes lazily on first reveal via
+    /// `PaneGroup::create_hidden_child_agent_pane`, so drill-down, the
+    /// remote-run view, and kill all work as for any remote placeholder.
+    ///
+    /// The placeholder lives on the owner (root) conversation's terminal
+    /// surface — the surface that renders the orchestration tree — matching
+    /// the shared-session viewer's placement of discovered children.
+    fn create_descendant_placeholder(
+        &mut self,
+        owner_conversation_id: AIConversationId,
+        parent_conversation_id: AIConversationId,
+        task: &AmbientAgentTask,
+        ctx: &mut ModelContext<Self>,
+    ) -> Option<AIConversationId> {
+        let Some(terminal_surface_id) = BlocklistAIHistoryModel::as_ref(ctx)
+            .terminal_surface_id_for_conversation(&owner_conversation_id)
+        else {
+            log::warn!(
+                "[orch-subtree] cannot place descendant run {}: owner conversation \
+                 {owner_conversation_id:?} has no live terminal surface",
+                task.task_id
+            );
+            return None;
+        };
+        let run_id = task.task_id.to_string();
+        let name = task.display_name().to_string();
+        let fallback_title = task.title.trim().to_string();
+        let harness = agent_task_harness(task);
+        let status = conversation_status_from_task_state(&task.state);
+        let conversation_id = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+            let conversation_id = history.start_new_child_conversation(
+                terminal_surface_id,
+                name,
+                parent_conversation_id,
+                harness,
+                ctx,
+            );
+            history.mark_conversation_as_remote_child(conversation_id, ctx);
+            if let Some(conversation) = history.conversation_mut(&conversation_id)
+                && !fallback_title.is_empty()
+            {
+                conversation.set_fallback_display_title(fallback_title);
+            }
+            history.assign_run_id_for_conversation(
+                conversation_id,
+                run_id.clone(),
+                Some(task.task_id),
+                terminal_surface_id,
+                ctx,
+            );
+            history.update_conversation_status(terminal_surface_id, conversation_id, status, ctx);
+            conversation_id
+        });
+        log::info!(
+            "[orch-subtree] placed descendant placeholder run_id={run_id} \
+             conversation_id={conversation_id:?} under parent {parent_conversation_id:?}"
+        );
+        Some(conversation_id)
+    }
+
+    /// Routes lifecycle transitions observed on an owner stream to the
+    /// matching remote placeholder conversations for strict descendants
+    /// below the direct-child level (grandchildren and deeper). Direct
+    /// children keep their existing status paths —
+    /// `WatchedRunStatusChanged` consumers and the hidden child pane's own
+    /// machinery — so their semantics are unchanged. A per-run monotonic
+    /// sequence guard keeps replayed events from regressing a status.
+    fn route_descendant_lifecycle_statuses(
+        &mut self,
+        owner_conversation_id: AIConversationId,
+        self_run_id: &str,
+        events: &[AgentRunEvent],
+        ctx: &mut ModelContext<Self>,
+    ) {
+        for event in events {
+            if event.run_id == self_run_id {
+                continue;
+            }
+            let Some(lifecycle_type) = lifecycle_event_type_from_wire(event.event_type.as_str())
+            else {
+                continue;
+            };
+            let last_applied = self
+                .descendant_status_sequences
+                .get(&event.run_id)
+                .copied()
+                .unwrap_or(0);
+            if event.sequence <= last_applied {
+                continue;
+            }
+            let target = {
+                let history = BlocklistAIHistoryModel::as_ref(ctx);
+                let Some(conversation_id) = history.conversation_id_for_agent_id(&event.run_id)
+                else {
+                    continue;
+                };
+                let Some(conversation) = history.conversation(&conversation_id) else {
+                    continue;
+                };
+                // Only passive remote placeholders take streamed statuses;
+                // locally-executing conversations own their own status.
+                if !conversation.is_remote_child() {
+                    continue;
+                }
+                // Direct children of the owner keep their existing paths.
+                if history.resolved_parent_conversation_id_for_conversation(conversation)
+                    == Some(owner_conversation_id)
+                {
+                    continue;
+                }
+                if !is_descendant_conversation(history, conversation_id, owner_conversation_id) {
+                    continue;
+                }
+                let Some(surface_id) =
+                    history.terminal_surface_id_for_conversation(&conversation_id)
+                else {
+                    continue;
+                };
+                (conversation_id, surface_id)
+            };
+            self.descendant_status_sequences
+                .insert(event.run_id.clone(), event.sequence);
+            let status = conversation_status_from_lifecycle_event_type(lifecycle_type);
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                history.update_conversation_status(target.1, target.0, status, ctx);
+            });
+        }
     }
 
     /// Tears down the current SSE connection and (if still eligible)
@@ -2215,8 +2748,38 @@ fn agent_event_filters_equivalent(a: &AgentEventFilter, b: &AgentEventFilter) ->
                 include_self: b_self,
             },
         ) => a_run == b_run && a_self == b_self,
+        (
+            AgentEventFilter::SubtreeRootRunId { root_run_id: a_run },
+            AgentEventFilter::SubtreeRootRunId { root_run_id: b_run },
+        ) => a_run == b_run,
         _ => false,
     }
+}
+
+/// True iff `conversation_id` sits strictly below `ancestor_id` in the
+/// locally-known orchestration topology, following resolved parent links.
+/// Missing ancestors and malformed parent cycles fail closed.
+fn is_descendant_conversation(
+    history: &BlocklistAIHistoryModel,
+    conversation_id: AIConversationId,
+    ancestor_id: AIConversationId,
+) -> bool {
+    let mut visited = HashSet::new();
+    let mut current = conversation_id;
+    while visited.insert(current) {
+        let Some(conversation) = history.conversation(&current) else {
+            return false;
+        };
+        let Some(parent) = history.resolved_parent_conversation_id_for_conversation(conversation)
+        else {
+            return false;
+        };
+        if parent == ancestor_id {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn agent_task_harness(task: &crate::ai::ambient_agents::task::AmbientAgentTask) -> Option<Harness> {
@@ -2283,6 +2846,27 @@ pub(super) fn conversation_status_from_lifecycle_event_type(
         // Forward-compat catch-all: matches the viewer's
         // `AmbientAgentTaskState::Unknown` → `Error` behaviour.
         api::LifecycleEventType::Unspecified => ConversationStatus::Error,
+    }
+}
+
+/// Maps a server-side run state to the [`ConversationStatus`] stamped on a
+/// freshly-placed descendant placeholder. Mirrors the collapsing rules in
+/// `orchestration_viewer_model::conversation_status_from_state`: working
+/// states collapse to `InProgress`, terminals map one-for-one, and the
+/// forward-compat `Unknown` maps to `Error`.
+fn conversation_status_from_task_state(state: &AmbientAgentTaskState) -> ConversationStatus {
+    match state {
+        AmbientAgentTaskState::Queued
+        | AmbientAgentTaskState::Pending
+        | AmbientAgentTaskState::Claimed
+        | AmbientAgentTaskState::InProgress => ConversationStatus::InProgress,
+        AmbientAgentTaskState::Succeeded => ConversationStatus::Success,
+        AmbientAgentTaskState::Failed | AmbientAgentTaskState::Error => ConversationStatus::Error,
+        AmbientAgentTaskState::Blocked => ConversationStatus::Blocked {
+            blocked_action: String::new(),
+        },
+        AmbientAgentTaskState::Cancelled => ConversationStatus::Cancelled,
+        AmbientAgentTaskState::Unknown => ConversationStatus::Error,
     }
 }
 
