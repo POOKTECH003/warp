@@ -108,6 +108,20 @@ impl PaneGroup {
         child_conversation_id: AIConversationId,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
+        self.ensure_hidden_child_agent_pane_with_depth(child_conversation_id, 0, ctx)
+    }
+
+    fn ensure_hidden_child_agent_pane_with_depth(
+        &mut self,
+        child_conversation_id: AIConversationId,
+        ancestor_depth: usize,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        /// Bounds the ancestor-materialization recursion below. Generously
+        /// above the server's orchestration depth limit; also guards against
+        /// malformed parent cycles.
+        const MAX_ANCESTOR_PANE_MATERIALIZATION_DEPTH: usize = 16;
+
         if self
             .child_agent_panes
             .get(&child_conversation_id)
@@ -144,9 +158,34 @@ impl PaneGroup {
 
         let child_owner_terminal_view_id =
             self.terminal_view_id_for_owned_conversation(child_conversation_id, ctx);
-        let Some(parent_pane_id) = self.pane_id_for_owned_conversation(parent_conversation_id, ctx)
-        else {
-            return child_owner_terminal_view_id.is_some();
+        let parent_pane_id = match self.pane_id_for_owned_conversation(parent_conversation_id, ctx)
+        {
+            Some(pane_id) => pane_id,
+            None => {
+                // A nested descendant's parent may itself be an
+                // unmaterialized detached placeholder (discovered on a
+                // subtree stream). Materialize the ancestor chain first so
+                // reveals work regardless of visit order.
+                if ancestor_depth >= MAX_ANCESTOR_PANE_MATERIALIZATION_DEPTH
+                    || !self.ensure_hidden_child_agent_pane_with_depth(
+                        parent_conversation_id,
+                        ancestor_depth + 1,
+                        ctx,
+                    )
+                {
+                    return child_owner_terminal_view_id.is_some();
+                }
+                match self
+                    .child_agent_panes
+                    .get(&parent_conversation_id)
+                    .copied()
+                    .filter(|pane_id| self.has_pane_id(*pane_id))
+                    .or_else(|| self.pane_id_for_owned_conversation(parent_conversation_id, ctx))
+                {
+                    Some(pane_id) => pane_id,
+                    None => return child_owner_terminal_view_id.is_some(),
+                }
+            }
         };
 
         if self.is_conversation_owned_outside_pane(child_conversation_id, parent_pane_id, ctx) {

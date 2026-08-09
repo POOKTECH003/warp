@@ -3194,6 +3194,126 @@ fn place_discovered_descendant_creates_nested_remote_placeholder() {
 }
 
 #[test]
+fn place_discovered_descendant_keeps_placeholder_off_live_surfaces() {
+    // Regression for a circular-view-reference panic: discovered
+    // placeholders registered as live on the owner's terminal surface let
+    // pane-swap resolution and ExitAgentView parent navigation resolve a
+    // descendant back to the orchestrator's own pane view and re-enter it
+    // mid-update. Placeholders must stay detached (like restored children)
+    // until their own hidden pane materializes.
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+        crate::test_util::settings::initialize_history_persistence_for_tests(&mut app);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let child = make_remote_child_conversation(SUBTREE_CHILD_RUN_ID, root_id);
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root, child], ctx);
+        });
+
+        let poller = streamer_with_permissive_task_fetch(&mut app);
+
+        let task = make_descendant_task(
+            SUBTREE_GRANDCHILD_RUN_ID,
+            Some(SUBTREE_CHILD_RUN_ID),
+            crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+            "Grandchild worker",
+        );
+        poller.update(&mut app, |me, ctx| {
+            me.place_discovered_descendant(root_id, task, 0, ctx);
+        });
+
+        history_model.read(&app, |model, _| {
+            let grandchild_id = model
+                .conversation_id_for_agent_id(SUBTREE_GRANDCHILD_RUN_ID)
+                .expect("grandchild run must be indexed");
+            assert_eq!(
+                model.terminal_surface_id_for_conversation(&grandchild_id),
+                None,
+                "discovered placeholders must not be live on any terminal surface"
+            );
+            assert!(
+                model
+                    .all_live_conversations_for_terminal_surface(terminal_view_id)
+                    .all(|conversation| conversation.id() != grandchild_id),
+                "the owner surface's live conversation list must not contain the placeholder"
+            );
+        });
+    });
+}
+
+#[test]
+fn descendant_lifecycle_routing_reaches_detached_placeholders() {
+    // A detached placeholder (pane not yet materialized) has no surface of
+    // its own; status routing must still apply, addressing the event at the
+    // owner's surface where the orchestration tree renders.
+    App::test((), |mut app| async move {
+        let _flag_guard = FeatureFlag::MultiLevelOrchestration.override_enabled(true);
+        crate::test_util::settings::initialize_history_persistence_for_tests(&mut app);
+
+        let history_model =
+            app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], vec![], &[]));
+        let root = make_root_conversation(SUBTREE_ROOT_RUN_ID);
+        let root_id = root.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![root], ctx);
+        });
+
+        let poller = streamer_with_no_fetch_expected(&mut app);
+        poller.update(&mut app, |me, ctx| {
+            me.place_discovered_descendant(
+                root_id,
+                make_descendant_task(
+                    SUBTREE_CHILD_RUN_ID,
+                    Some(SUBTREE_ROOT_RUN_ID),
+                    crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+                    "Child",
+                ),
+                0,
+                ctx,
+            );
+            me.place_discovered_descendant(
+                root_id,
+                make_descendant_task(
+                    SUBTREE_GRANDCHILD_RUN_ID,
+                    Some(SUBTREE_CHILD_RUN_ID),
+                    crate::ai::ambient_agents::AmbientAgentTaskState::InProgress,
+                    "Grandchild",
+                ),
+                0,
+                ctx,
+            );
+            me.route_descendant_lifecycle_statuses(
+                root_id,
+                SUBTREE_ROOT_RUN_ID,
+                &[make_lifecycle_event(
+                    "run_succeeded",
+                    SUBTREE_GRANDCHILD_RUN_ID,
+                    10,
+                )],
+                ctx,
+            );
+        });
+
+        history_model.read(&app, |model, _| {
+            let grandchild_id = model
+                .conversation_id_for_agent_id(SUBTREE_GRANDCHILD_RUN_ID)
+                .expect("grandchild placeholder must exist");
+            assert_eq!(
+                model.conversation_status(&grandchild_id),
+                Some(&ConversationStatus::Success),
+                "routing must reach placeholders that are not live on any surface"
+            );
+        });
+    });
+}
+
+#[test]
 fn place_discovered_descendant_dedupes_runs_registered_meanwhile() {
     // A `run_agents` spawn can register the same run while the discovery
     // fetch is in flight; placement must not create a duplicate conversation.

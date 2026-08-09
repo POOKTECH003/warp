@@ -14,7 +14,9 @@ use warpui::{
     Entity, EntityId, GetSingletonModelHandle, ModelContext, SingletonEntity, UpdateModel,
 };
 
-use super::history_model::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
+use super::history_model::{
+    BlocklistAIHistoryEvent, BlocklistAIHistoryModel, DetachedRemoteChildPlaceholder,
+};
 use super::orchestration_events::{
     LifecycleEventDetailPayload, LifecycleEventDetailStage, OrchestrationEventService,
     PendingEvent, PendingEventDetail, build_lifecycle_event,
@@ -2538,17 +2540,20 @@ impl OrchestrationEventStreamer {
     }
 
     /// Creates a remote-child placeholder conversation for `task` under
-    /// `parent_conversation_id`, mirroring the placeholder shape produced by
-    /// `run_agents` remote-child launches: linked through the history
-    /// model's parent → children index, marked remote, indexed by run_id,
-    /// and carrying display metadata + status from the fetched task. The
-    /// hidden pane materializes lazily on first reveal via
+    /// `parent_conversation_id`: linked through the history model's parent
+    /// → children index, marked remote, indexed by run_id, and carrying
+    /// display metadata + status from the fetched task. The hidden pane
+    /// materializes lazily on first reveal via
     /// `PaneGroup::create_hidden_child_agent_pane`, so drill-down, the
     /// remote-run view, and kill all work as for any remote placeholder.
     ///
-    /// The placeholder lives on the owner (root) conversation's terminal
-    /// surface — the surface that renders the orchestration tree — matching
-    /// the shared-session viewer's placement of discovered children.
+    /// The placeholder is deliberately DETACHED — not live on any terminal
+    /// surface — matching the shape of restored orchestration children.
+    /// Registering it on the owner's surface instead would let pane-swap
+    /// resolution and parent navigation resolve descendants back to the
+    /// orchestrator's own pane view and re-enter it mid-update (circular
+    /// view reference panic). The owner's surface is used only to address
+    /// the initial status event at the surface rendering the tree.
     fn create_descendant_placeholder(
         &mut self,
         owner_conversation_id: AIConversationId,
@@ -2556,7 +2561,7 @@ impl OrchestrationEventStreamer {
         task: &AmbientAgentTask,
         ctx: &mut ModelContext<Self>,
     ) -> Option<AIConversationId> {
-        let Some(terminal_surface_id) = BlocklistAIHistoryModel::as_ref(ctx)
+        let Some(owner_surface_id) = BlocklistAIHistoryModel::as_ref(ctx)
             .terminal_surface_id_for_conversation(&owner_conversation_id)
         else {
             log::warn!(
@@ -2572,27 +2577,18 @@ impl OrchestrationEventStreamer {
         let harness = agent_task_harness(task);
         let status = conversation_status_from_task_state(&task.state);
         let conversation_id = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-            let conversation_id = history.start_new_child_conversation(
-                terminal_surface_id,
-                name,
-                parent_conversation_id,
-                harness,
+            let conversation_id = history.register_detached_remote_child_placeholder(
+                DetachedRemoteChildPlaceholder {
+                    parent_conversation_id,
+                    run_id: run_id.clone(),
+                    task_id: task.task_id,
+                    agent_name: name,
+                    fallback_title: Some(fallback_title),
+                    orchestration_harness: harness,
+                },
                 ctx,
             );
-            history.mark_conversation_as_remote_child(conversation_id, ctx);
-            if let Some(conversation) = history.conversation_mut(&conversation_id)
-                && !fallback_title.is_empty()
-            {
-                conversation.set_fallback_display_title(fallback_title);
-            }
-            history.assign_run_id_for_conversation(
-                conversation_id,
-                run_id.clone(),
-                Some(task.task_id),
-                terminal_surface_id,
-                ctx,
-            );
-            history.update_conversation_status(terminal_surface_id, conversation_id, status, ctx);
+            history.update_conversation_status(owner_surface_id, conversation_id, status, ctx);
             conversation_id
         });
         log::info!(
@@ -2655,8 +2651,14 @@ impl OrchestrationEventStreamer {
                 if !is_descendant_conversation(history, conversation_id, owner_conversation_id) {
                     continue;
                 }
-                let Some(surface_id) =
-                    history.terminal_surface_id_for_conversation(&conversation_id)
+                // Detached placeholders (pane not yet materialized) are not
+                // live on any surface; address their status events at the
+                // owner's surface, where the orchestration tree renders.
+                let Some(surface_id) = history
+                    .terminal_surface_id_for_conversation(&conversation_id)
+                    .or_else(|| {
+                        history.terminal_surface_id_for_conversation(&owner_conversation_id)
+                    })
                 else {
                     continue;
                 };

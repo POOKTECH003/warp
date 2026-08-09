@@ -593,6 +593,61 @@ impl BlocklistAIHistoryModel {
         self.index_child_conversation(child_id, parent_id);
     }
 
+    /// Registers a detached remote-child placeholder for a descendant run
+    /// discovered on a root-scoped subtree stream (see
+    /// [`DetachedRemoteChildPlaceholder`]): the conversation is
+    /// loaded and indexed (parent → children, run-id index) but
+    /// deliberately NOT live on any terminal surface. Like restored
+    /// orchestration children, it becomes live only when its hidden pane
+    /// materializes on first reveal.
+    ///
+    /// Keeping discovered placeholders off live surfaces preserves the
+    /// owner-side invariant that a child conversation is only ever owned by
+    /// its own pane's surface — never the orchestrator's — which pane-swap
+    /// resolution and parent navigation rely on to avoid re-entering the
+    /// orchestrator's pane view.
+    pub fn register_detached_remote_child_placeholder(
+        &mut self,
+        placeholder: DetachedRemoteChildPlaceholder,
+        ctx: &mut ModelContext<Self>,
+    ) -> AIConversationId {
+        let DetachedRemoteChildPlaceholder {
+            parent_conversation_id,
+            run_id,
+            task_id,
+            agent_name,
+            fallback_title,
+            orchestration_harness,
+        } = placeholder;
+        let mut conversation = AIConversation::new(false, false);
+        conversation.set_agent_name(agent_name);
+        if let Some(parent_agent_id) = self
+            .conversation(&parent_conversation_id)
+            .and_then(|parent| parent.orchestration_agent_id())
+        {
+            conversation.set_parent_agent_id(parent_agent_id);
+        }
+        if let Some(harness) = orchestration_harness {
+            conversation.set_orchestration_harness(harness);
+        }
+        if let Some(title) = fallback_title.filter(|title| !title.is_empty()) {
+            conversation.set_fallback_display_title(title);
+        }
+        conversation.set_parent_conversation_id(parent_conversation_id);
+        conversation.mark_as_remote_child();
+        conversation.set_run_id(run_id.clone());
+        conversation.set_task_id(task_id);
+
+        let conversation_id = conversation.id();
+        self.conversations_by_id
+            .insert(conversation_id, conversation);
+        self.index_child_conversation(conversation_id, parent_conversation_id);
+        self.agent_id_to_conversation_id
+            .insert(run_id, conversation_id);
+        self.persist_conversation_state(conversation_id, ctx);
+        conversation_id
+    }
+
     /// Returns the child conversation IDs for a parent from the startup index.
     /// Unlike `child_conversations_of`, this works before children are loaded
     /// into `conversations_by_id`.
@@ -2895,6 +2950,18 @@ fn agent_id_key(conversation: &AIConversation) -> Option<String> {
 
 fn agent_id_key_from_persisted_data(conversation_data: &AgentConversationData) -> Option<&str> {
     conversation_data.run_id.as_deref()
+}
+
+/// Identity and display metadata for a descendant run discovered on a
+/// root-scoped subtree stream, registered through
+/// [`BlocklistAIHistoryModel::register_detached_remote_child_placeholder`].
+pub struct DetachedRemoteChildPlaceholder {
+    pub parent_conversation_id: AIConversationId,
+    pub run_id: String,
+    pub task_id: crate::ai::ambient_agents::AmbientAgentTaskId,
+    pub agent_name: String,
+    pub fallback_title: Option<String>,
+    pub orchestration_harness: Option<Harness>,
 }
 
 /// Whether an `UpdatedConversationStatus` event represents a restoration
