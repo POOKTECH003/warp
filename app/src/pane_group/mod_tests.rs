@@ -1008,6 +1008,85 @@ fn test_restored_remote_hidden_child_pane_enters_existing_ambient_session() {
     });
 }
 
+/// A hydrated remote-child placeholder whose task has an attachable live
+/// session must actually join that session — not just bind the task to the
+/// ambient view model. Regression test for revealing a subtree-discovered
+/// descendant of a running orchestration rendering the empty cloud
+/// zero-state: `enter_viewing_existing_session` moved the pane to
+/// `AgentRunning` but the deferred shared-session viewer was never
+/// connected, so no transcript streamed. Direct children mask this because
+/// their dispatch-time panes join via the spawn stream; this hydration path
+/// is the only join driver for restored/discovered placeholders.
+#[test]
+fn test_hydrated_remote_child_with_attachable_live_session_joins_shared_session() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let parent_pane_id = get_newly_created_pane_id(panes, &[]);
+            let parent_conversation_id = start_parent_conversation(panes, parent_pane_id, ctx);
+            let task_id = new_ambient_agent_task_id();
+            let session_id: SessionId = "22222222-2222-2222-2222-222222222222".parse().unwrap();
+
+            let mut task = ambient_agent_task_for_current_user(task_id);
+            task.state = AmbientAgentTaskState::InProgress;
+            task.is_sandbox_running = true;
+            task.session_id = Some(session_id.to_string());
+            AgentConversationsModel::handle(ctx).update(ctx, |model, _| {
+                model.insert_task_for_test(task);
+            });
+
+            let mut child_conversation = AIConversation::new(false, false);
+            child_conversation.set_parent_conversation_id(parent_conversation_id);
+            child_conversation.set_task_id(task_id);
+            child_conversation.mark_as_remote_child();
+            let child_conversation_id = child_conversation.id();
+
+            panes.create_hidden_child_agent_pane(child_conversation, parent_pane_id, ctx);
+
+            let child_pane_id = panes
+                .child_agent_panes
+                .get(&child_conversation_id)
+                .copied()
+                .expect("hydrated remote child pane should be tracked");
+
+            let (ambient_task_id, is_agent_running, active_conversation_id) =
+                ambient_child_session_state(panes, child_pane_id, ctx);
+            assert_eq!(ambient_task_id, Some(task_id));
+            assert!(is_agent_running);
+            assert_eq!(active_conversation_id, Some(child_conversation_id));
+
+            let terminal_view = panes
+                .terminal_view_from_pane_id(child_pane_id, ctx)
+                .expect("remote child pane should have a terminal view");
+            assert_eq!(
+                terminal_view
+                    .as_ref(ctx)
+                    .ambient_agent_view_model()
+                    .expect("child pane should have an ambient agent model")
+                    .as_ref(ctx)
+                    .active_execution_session_id_for_test(),
+                Some(session_id),
+                "live-attach hydration must record the run's live execution session",
+            );
+
+            // The join is initiated synchronously: `connect_session` moves
+            // the deferred viewer to `ViewPending` before the async network
+            // handshake runs.
+            assert!(
+                terminal_view
+                    .as_ref(ctx)
+                    .model
+                    .lock()
+                    .shared_session_status()
+                    .is_view_pending(),
+                "live-attach hydration must connect the deferred shared-session viewer",
+            );
+        });
+    });
+}
+
 /// Fix B: when task data for a restored remote child is NOT yet cached at
 /// `create_hidden_child_agent_pane` time, the placeholder must still be
 /// registered in `child_agent_panes` keyed by its local AIConversationId,
@@ -3301,6 +3380,9 @@ fn hydration_decision_task(
 #[test]
 fn decide_remote_child_hydration_attachable_live_session_chooses_live_attach() {
     // InProgress + sandbox running + parseable session id -> Attachable.
+    // The decision must carry the parsed session id so the dispatch arm can
+    // actually join the live session.
+    let session_id: SessionId = "11111111-1111-1111-1111-111111111111".parse().unwrap();
     let task = hydration_decision_task(
         AmbientAgentTaskState::InProgress,
         true,
@@ -3309,14 +3391,12 @@ fn decide_remote_child_hydration_attachable_live_session_chooses_live_attach() {
     );
     assert_eq!(
         task.active_live_session_state(),
-        AmbientAgentLiveSessionState::Attachable {
-            session_id: "11111111-1111-1111-1111-111111111111".parse().unwrap(),
-        },
+        AmbientAgentLiveSessionState::Attachable { session_id },
     );
 
     assert_eq!(
         decide_remote_child_hydration_action(&task),
-        RemoteChildHydrationAction::LiveAttach,
+        RemoteChildHydrationAction::LiveAttach { session_id },
     );
 }
 

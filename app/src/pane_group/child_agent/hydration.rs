@@ -1,3 +1,4 @@
+use session_sharing_protocol::common::SessionId;
 use warp_errors::report_error;
 use warpui::{SingletonEntity, ViewContext};
 
@@ -11,6 +12,7 @@ use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::blocklist::history_model::CloudConversationData;
 use crate::pane_group::{AmbientAgentViewModelHandleExt, PaneGroup, PaneId};
+use crate::terminal::shared_session;
 use crate::terminal::view::load_ai_conversation::{
     RestoreConversationEntryBehavior, RestoredAIConversation,
 };
@@ -20,7 +22,7 @@ use crate::terminal::view::load_ai_conversation::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::pane_group) enum RemoteChildHydrationAction {
     /// Attachable live session — join it in place.
-    LiveAttach,
+    LiveAttach { session_id: SessionId },
     /// No live session but a server conversation token is available;
     /// `task_is_terminal` controls whether the post-merge step inserts a
     /// conversation-ended tombstone (only terminal runs do).
@@ -41,11 +43,8 @@ pub(in crate::pane_group) fn decide_remote_child_hydration_action(
     task: &AmbientAgentTask,
 ) -> RemoteChildHydrationAction {
     let live_session_state = task.active_live_session_state();
-    if matches!(
-        live_session_state,
-        AmbientAgentLiveSessionState::Attachable { .. }
-    ) {
-        return RemoteChildHydrationAction::LiveAttach;
+    if let AmbientAgentLiveSessionState::Attachable { session_id } = live_session_state {
+        return RemoteChildHydrationAction::LiveAttach { session_id };
     }
 
     let task_is_terminal = matches!(live_session_state, AmbientAgentLiveSessionState::Inactive);
@@ -188,8 +187,9 @@ impl PaneGroup {
         };
 
         match decide_remote_child_hydration_action(&task) {
-            RemoteChildHydrationAction::LiveAttach => {
+            RemoteChildHydrationAction::LiveAttach { session_id } => {
                 self.apply_existing_ambient_task_to_pane(pane_id, child_id, task_id, ctx);
+                self.connect_hidden_child_pane_to_live_session(pane_id, session_id, ctx);
             }
             RemoteChildHydrationAction::LoadTranscript {
                 server_token,
@@ -218,6 +218,65 @@ impl PaneGroup {
                 );
             }
         }
+    }
+
+    /// Connects a hydrated hidden child pane's deferred shared-session
+    /// viewer to the run's live execution session.
+    ///
+    /// `enter_viewing_existing_session` only binds the task to the ambient
+    /// view model; the deferred viewer `TerminalManager` still needs an
+    /// explicit join, otherwise the pane renders the empty cloud zero-state
+    /// while the run streams. The join drivers used by dispatch-time panes
+    /// (`SessionReady` / `ExecutionSessionReady`) only fire from the spawn
+    /// stream or an explicit `attach_execution_session`, neither of which
+    /// runs on this restore/discovery path. Connects with full scrollback
+    /// replay (not the follow-up append mode, which suppresses the agent
+    /// conversation replay) so a mid-run join backfills the transcript.
+    fn connect_hidden_child_pane_to_live_session(
+        &mut self,
+        pane_id: PaneId,
+        session_id: SessionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(terminal_view) = self.terminal_view_from_pane_id(pane_id, ctx) {
+            terminal_view.update(ctx, |terminal_view, ctx| {
+                if let Some(ambient_agent_view_model) = terminal_view
+                    .ambient_agent_view_model()
+                    .into_optional_handle()
+                    .cloned()
+                {
+                    // Record the live session without emitting
+                    // `ExecutionSessionReady` — the viewer join below is
+                    // driven directly, and the recorded id keeps
+                    // `is_ready_for_cloud_followup_prompt` false while the
+                    // session is live.
+                    ambient_agent_view_model.update(ctx, |model, _| {
+                        model.set_live_execution_session(session_id);
+                    });
+                }
+                terminal_view.prepare_for_live_session_reattach(ctx);
+            });
+        }
+
+        let Some(terminal_manager) = self
+            .terminal_session_by_id(pane_id)
+            .map(|session| session.terminal_manager(ctx))
+        else {
+            return;
+        };
+        terminal_manager.update(ctx, |terminal_manager, ctx| {
+            let Some(viewer_manager) = terminal_manager
+                .as_any_mut()
+                .downcast_mut::<shared_session::viewer::TerminalManager>()
+            else {
+                log::warn!(
+                    "connect_hidden_child_pane_to_live_session: pane manager is not a \
+                     shared-session viewer"
+                );
+                return;
+            };
+            viewer_manager.connect_to_session(session_id, false, ctx);
+        });
     }
 
     /// Attaches the hidden child pane's ambient agent view model to the

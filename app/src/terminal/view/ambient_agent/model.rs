@@ -882,6 +882,12 @@ impl AmbientAgentViewModel {
         ctx.emit(AmbientAgentViewModelEvent::EnvironmentSelected);
     }
 
+    /// Test-only accessor for the recorded live execution session id.
+    #[cfg(test)]
+    pub fn active_execution_session_id_for_test(&self) -> Option<SessionId> {
+        self.active_execution_session_id
+    }
+
     pub fn record_ambient_execution_ended(
         &mut self,
         session_id: SessionId,
