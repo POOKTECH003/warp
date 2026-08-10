@@ -162,33 +162,30 @@ fn append_fuzzy_match_failure_details(message: &mut String, match_failures: &Dif
         return;
     }
 
-    message.push_str(
-        " Update each failed search block to match the file exactly, then retry. The following search blocks could not be matched:",
-    );
-    for (index, failure) in match_failures
-        .fuzzy_match_failure_details
-        .iter()
-        .enumerate()
-    {
-        let _ = write!(message, "\n{}. ", index + 1);
+    message.push_str(" The following search blocks did not match the current file contents:");
+    for failure in &match_failures.fuzzy_match_failure_details {
+        message.push('\n');
         append_fuzzy_match_failure(message, failure);
     }
 }
 
 fn append_fuzzy_match_failure(message: &mut String, failure: &DiffMatchFailure) {
-    // Parse the range of lines that the search block was expected to match.
+    let _ = write!(
+        message,
+        "Search block {} of {}",
+        failure.block_number, failure.block_count
+    );
+
     if let Some(range) = &failure.range {
         let end_line = range.end.saturating_sub(1);
         if range.start == end_line {
-            let _ = write!(message, "Expected line {}. ", range.start);
+            let _ = write!(message, " (expected line {})", range.start);
         } else {
-            let _ = write!(message, "Expected lines {}-{}. ", range.start, end_line);
+            let _ = write!(message, " (expected lines {}-{})", range.start, end_line);
         }
     }
 
-    // Add the search block.
-    message.push_str("Search:\n");
-    message.push_str(&failure.search);
+    message.push('.');
 }
 
 /// Given a list of suggested edits from the server API, parse it into applicable diffs to be shown

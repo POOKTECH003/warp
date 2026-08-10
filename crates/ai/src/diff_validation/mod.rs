@@ -324,11 +324,6 @@ fn remove_extra_line_num_prefix(replace: String) -> String {
         .join("\n")
 }
 
-/// Each failed search block is echoed back to the model in the retry message, so cap the
-/// surfaced text: an oversized block would otherwise bloat the context window and crowd out the
-/// other enumerated failures.
-const MAX_DIFF_MATCH_FAILURE_BYTES: usize = 1_000;
-
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct DiffMatchFailures {
     /// Failures to perform a fuzzy match with content.
@@ -337,42 +332,20 @@ pub struct DiffMatchFailures {
     pub noop_deltas: u8,
     /// Search blocks that are missing line numbers.
     pub missing_line_numbers: u8,
-    /// The search blocks that failed to fuzzy match. Skipped for telemetry.
+    /// Identifiers for blocks that failed to fuzzy match. Skipped for telemetry.
     #[serde(skip)]
     pub fuzzy_match_failure_details: Vec<DiffMatchFailure>,
 }
 
+/// Identifies a search/hunk block that failed to match, without carrying file content.
+///
+/// `block_number` is 1-based and refers to the block's position among all blocks for the file in
+/// the original tool call (not merely among failures). `block_count` is that same total.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffMatchFailure {
-    pub search: String,
+    pub block_number: usize,
+    pub block_count: usize,
     pub range: Option<Range<usize>>,
-}
-
-fn capped_failure_text(text: &str) -> String {
-    if text.len() <= MAX_DIFF_MATCH_FAILURE_BYTES {
-        return text.to_string();
-    }
-
-    let mut end = 0;
-    for (index, char) in text.char_indices() {
-        let next = index + char.len_utf8();
-        if next > MAX_DIFF_MATCH_FAILURE_BYTES {
-            break;
-        }
-        end = next;
-    }
-
-    format!("{}\n... [truncated]", &text[..end])
-}
-
-fn v4a_hunk_search_text(diff: &V4AHunk) -> String {
-    [
-        diff.pre_context.lines().collect_vec(),
-        diff.old.lines().collect_vec(),
-        diff.post_context.lines().collect_vec(),
-    ]
-    .concat()
-    .join("\n")
 }
 
 /// Fix two common issues with responses from the models that request code actions:
@@ -436,8 +409,9 @@ pub fn fuzzy_match_v4a_diffs(
     let mut failures = DiffMatchFailures::default();
 
     let file_lines: Vec<&str> = file_content.lines().collect();
+    let block_count = diffs.len();
 
-    for diff in diffs {
+    for (block_index, diff) in diffs.iter().enumerate() {
         // Check for no-op diffs
         if diff.old == diff.new {
             log::info!("Ignoring V4A diff with identical old and new content.");
@@ -469,7 +443,8 @@ pub fn fuzzy_match_v4a_diffs(
                 log::warn!("Failed to find matching location for V4A diff");
                 failures.fuzzy_match_failures += 1;
                 failures.fuzzy_match_failure_details.push(DiffMatchFailure {
-                    search: capped_failure_text(&v4a_hunk_search_text(diff)),
+                    block_number: block_index + 1,
+                    block_count,
                     range: None,
                 });
             }
@@ -537,8 +512,9 @@ fn fuzzy_match_file_diffs(
     let mut failures = DiffMatchFailures::default();
 
     let target_lines: Vec<&str> = lines(file_content).collect();
+    let block_count = diffs.len();
 
-    for diff in diffs {
+    for (block_index, diff) in diffs.iter().enumerate() {
         #[cfg(debug_assertions)]
         log::debug!("{diff:#?}");
 
@@ -672,7 +648,8 @@ fn fuzzy_match_file_diffs(
             None => {
                 failures.fuzzy_match_failures += 1;
                 failures.fuzzy_match_failure_details.push(DiffMatchFailure {
-                    search: capped_failure_text(&search),
+                    block_number: block_index + 1,
+                    block_count,
                     range: parsed_line_range,
                 });
             }
