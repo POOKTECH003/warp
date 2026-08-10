@@ -3,6 +3,8 @@ use std::fs::ReadDir;
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::anyhow;
+use instant::Instant;
 use typed_path::TypedPath;
 use warp_completer::completer::{CommandExitStatus, EngineDirEntry, EngineFileType};
 use warp_util::path::ShellFamily;
@@ -36,24 +38,51 @@ pub(super) async fn list_entries(
         entries.push(engine_entry);
     }
 
-    if !unresolved_symlinks.is_empty()
-        && session_context.session.is_wsl()
-        && let Some(guest_dirs) = guest_directory_names(session_context, directory).await
-    {
-        upgrade_directory_symlinks(&mut entries, &unresolved_symlinks, &guest_dirs);
+    if !unresolved_symlinks.is_empty() && session_context.session.is_wsl() {
+        let started = Instant::now();
+        let outcome = classify_with_guest(session_context, directory).await;
+        let elapsed_ms = started.elapsed().as_millis();
+        let unresolved = unresolved_symlinks.len();
+        match outcome {
+            GuestOutcome::Classified(guest_dirs) => {
+                let upgraded =
+                    upgrade_directory_symlinks(&mut entries, &unresolved_symlinks, &guest_dirs);
+                log::debug!(
+                    "[APP-3993 wsl-classify] ok upgraded={upgraded} unresolved={unresolved} elapsed_ms={elapsed_ms}"
+                );
+            }
+            GuestOutcome::NonZeroExit => log::warn!(
+                "[APP-3993 wsl-classify] non-zero exit unresolved={unresolved} elapsed_ms={elapsed_ms}"
+            ),
+            GuestOutcome::Failed(err) => log::warn!(
+                "[APP-3993 wsl-classify] failed unresolved={unresolved} elapsed_ms={elapsed_ms}: {err:#}"
+            ),
+            GuestOutcome::TimedOut => log::warn!(
+                "[APP-3993 wsl-classify] timed out unresolved={unresolved} elapsed_ms={elapsed_ms}"
+            ),
+        }
     }
 
     entries
 }
 
-/// Returns the immediate children of `directory` that the guest reports as directories, or `None`
-/// on any failure or timeout so completion degrades to the host classification rather than
-/// stalling on a slow guest.
-async fn guest_directory_names(
+/// Keeps the guest failure modes distinct so one call site can report the outcome with its timing.
+enum GuestOutcome {
+    Classified(HashSet<String>),
+    NonZeroExit,
+    Failed(anyhow::Error),
+    TimedOut,
+}
+
+/// Asks the guest which immediate children of `directory` are directories. Any failure leaves the
+/// host classification in place rather than stalling completion on a slow guest.
+async fn classify_with_guest(
     session_context: &SessionContext,
     directory: &TypedPath<'_>,
-) -> Option<HashSet<String>> {
-    let script = find_dirs_script_for_dir(directory)?;
+) -> GuestOutcome {
+    let Some(script) = find_dirs_script_for_dir(directory) else {
+        return GuestOutcome::Failed(anyhow!("directory path is not valid UTF-8"));
+    };
     let env_vars = session_context
         .session
         .path()
@@ -65,19 +94,13 @@ async fn guest_directory_names(
         .with_timeout(GUEST_CLASSIFY_TIMEOUT)
         .await;
     match result {
-        Ok(Ok(output)) if output.status == CommandExitStatus::Success => output
-            .to_string()
-            .ok()
-            .map(|output| parse_directory_names(&output)),
-        Ok(Ok(_)) => None,
-        Ok(Err(err)) => {
-            log::warn!("Guest directory classification command failed: {err:#}");
-            None
-        }
-        Err(_timed_out) => {
-            log::warn!("Guest directory classification command timed out");
-            None
-        }
+        Ok(Ok(output)) if output.status == CommandExitStatus::Success => match output.to_string() {
+            Ok(output) => GuestOutcome::Classified(parse_directory_names(&output)),
+            Err(err) => GuestOutcome::Failed(err),
+        },
+        Ok(Ok(_)) => GuestOutcome::NonZeroExit,
+        Ok(Err(err)) => GuestOutcome::Failed(err),
+        Err(_timed_out) => GuestOutcome::TimedOut,
     }
 }
 
@@ -100,20 +123,23 @@ fn parse_directory_names(output: &str) -> HashSet<String> {
 }
 
 /// Only entries the host left as unresolved symlinks are upgraded, so a non-symlink the guest
-/// happens to list as a directory keeps the host's classification.
+/// happens to list as a directory keeps the host's classification. Returns how many were upgraded.
 fn upgrade_directory_symlinks(
     entries: &mut [EngineDirEntry],
     unresolved_symlinks: &HashSet<String>,
     guest_dirs: &HashSet<String>,
-) {
+) -> usize {
+    let mut upgraded = 0;
     for entry in entries.iter_mut() {
         if !entry.is_dir()
             && unresolved_symlinks.contains(entry.file_name())
             && guest_dirs.contains(entry.file_name())
         {
             entry.file_type = EngineFileType::Directory;
+            upgraded += 1;
         }
     }
+    upgraded
 }
 
 #[cfg(test)]

@@ -29,8 +29,10 @@ fn test_upgrade_directory_symlinks() {
         "not_a_symlink".to_owned(),
     ]);
 
-    super::upgrade_directory_symlinks(&mut entries, &unresolved_symlinks, &guest_dirs);
+    let upgraded =
+        super::upgrade_directory_symlinks(&mut entries, &unresolved_symlinks, &guest_dirs);
 
+    assert_eq!(upgraded, 1);
     let by_name: HashMap<&str, &EngineDirEntry> = entries
         .iter()
         .map(|entry| (entry.file_name(), entry))
