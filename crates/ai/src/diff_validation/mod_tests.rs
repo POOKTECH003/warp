@@ -196,11 +196,7 @@ fn test_totally_unrelated_search() {
     assert_eq!(failures.fuzzy_match_failures, 1);
     assert_eq!(
         failures.fuzzy_match_failure_details,
-        vec![DiffMatchFailure {
-            block_number: 2,
-            block_count: 2,
-            range: Some(4..5),
-        }]
+        vec![DiffMatchFailure { block_number: 2 }]
     );
 }
 
@@ -428,11 +424,7 @@ fn test_v4a_no_match() {
     assert_eq!(failures.fuzzy_match_failures, 1);
     assert_eq!(
         failures.fuzzy_match_failure_details,
-        vec![DiffMatchFailure {
-            block_number: 1,
-            block_count: 1,
-            range: None,
-        }]
+        vec![DiffMatchFailure { block_number: 1 }]
     );
 }
 
@@ -463,11 +455,7 @@ fn test_v4a_failure_preserves_original_block_ordinal() {
     assert_eq!(failures.fuzzy_match_failures, 1);
     assert_eq!(
         failures.fuzzy_match_failure_details,
-        vec![DiffMatchFailure {
-            block_number: 2,
-            block_count: 2,
-            range: None,
-        }]
+        vec![DiffMatchFailure { block_number: 2 }]
     );
 }
 

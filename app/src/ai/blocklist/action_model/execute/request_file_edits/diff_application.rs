@@ -170,22 +170,7 @@ fn append_fuzzy_match_failure_details(message: &mut String, match_failures: &Dif
 }
 
 fn append_fuzzy_match_failure(message: &mut String, failure: &DiffMatchFailure) {
-    let _ = write!(
-        message,
-        "Search block {} of {}",
-        failure.block_number, failure.block_count
-    );
-
-    if let Some(range) = &failure.range {
-        let end_line = range.end.saturating_sub(1);
-        if range.start == end_line {
-            let _ = write!(message, " (expected line {})", range.start);
-        } else {
-            let _ = write!(message, " (expected lines {}-{})", range.start, end_line);
-        }
-    }
-
-    message.push('.');
+    let _ = write!(message, "Search block {}.", failure.block_number);
 }
 
 /// Given a list of suggested edits from the server API, parse it into applicable diffs to be shown

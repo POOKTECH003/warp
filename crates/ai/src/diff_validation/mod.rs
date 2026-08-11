@@ -340,12 +340,10 @@ pub struct DiffMatchFailures {
 /// Identifies a search/hunk block that failed to match, without carrying file content.
 ///
 /// `block_number` is 1-based and refers to the block's position among all blocks for the file in
-/// the original tool call (not merely among failures). `block_count` is that same total.
+/// the original tool call (not merely among failures).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiffMatchFailure {
     pub block_number: usize,
-    pub block_count: usize,
-    pub range: Option<Range<usize>>,
 }
 
 /// Fix two common issues with responses from the models that request code actions:
@@ -409,7 +407,6 @@ pub fn fuzzy_match_v4a_diffs(
     let mut failures = DiffMatchFailures::default();
 
     let file_lines: Vec<&str> = file_content.lines().collect();
-    let block_count = diffs.len();
 
     for (block_index, diff) in diffs.iter().enumerate() {
         // Check for no-op diffs
@@ -444,8 +441,6 @@ pub fn fuzzy_match_v4a_diffs(
                 failures.fuzzy_match_failures += 1;
                 failures.fuzzy_match_failure_details.push(DiffMatchFailure {
                     block_number: block_index + 1,
-                    block_count,
-                    range: None,
                 });
             }
         }
@@ -512,14 +507,12 @@ fn fuzzy_match_file_diffs(
     let mut failures = DiffMatchFailures::default();
 
     let target_lines: Vec<&str> = lines(file_content).collect();
-    let block_count = diffs.len();
 
     for (block_index, diff) in diffs.iter().enumerate() {
         #[cfg(debug_assertions)]
         log::debug!("{diff:#?}");
 
         let (mut line_range, search) = parse_line_numbers(&diff.search);
-        let parsed_line_range = line_range.clone();
 
         // Missing line numbers are not necessarily fatal, due to fuzzy matching, but we still
         // want to track them.
@@ -649,8 +642,6 @@ fn fuzzy_match_file_diffs(
                 failures.fuzzy_match_failures += 1;
                 failures.fuzzy_match_failure_details.push(DiffMatchFailure {
                     block_number: block_index + 1,
-                    block_count,
-                    range: parsed_line_range,
                 });
             }
         }

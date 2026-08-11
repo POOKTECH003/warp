@@ -641,17 +641,13 @@ fn test_format_match_error() {
             fuzzy_match_failures: 1,
             noop_deltas: 0,
             missing_line_numbers: 0,
-            fuzzy_match_failure_details: vec![DiffMatchFailure {
-                block_number: 1,
-                block_count: 1,
-                range: Some(1..2),
-            }],
+            fuzzy_match_failure_details: vec![DiffMatchFailure { block_number: 1 }],
         },
     };
 
     assert_eq!(
         err.to_conversation_message(),
-        "Could not apply all diffs to file.txt. The following search blocks did not match the current file contents:\nSearch block 1 of 1 (expected line 1)."
+        "Could not apply all diffs to file.txt. The following search blocks did not match the current file contents:\nSearch block 1."
     );
 
     let err = DiffApplicationError::UnmatchedDiffs {
@@ -692,39 +688,22 @@ fn test_format_match_error() {
             fuzzy_match_failures: 2,
             noop_deltas: 2,
             missing_line_numbers: 0,
-            fuzzy_match_failure_details: vec![DiffMatchFailure {
-                block_number: 2,
-                block_count: 3,
-                range: None,
-            }],
+            fuzzy_match_failure_details: vec![DiffMatchFailure { block_number: 2 }],
         },
     };
 
-    // V4A failures omit expected line ranges and keep the original block ordinal.
     assert_eq!(
         err.to_conversation_message(),
-        "Could not apply all diffs to file.txt. The following search blocks did not match the current file contents:\nSearch block 2 of 3.\nThe changes to file.txt were already made."
+        "Could not apply all diffs to file.txt. The following search blocks did not match the current file contents:\nSearch block 2.\nThe changes to file.txt were already made."
     );
 }
 
 #[test]
 fn test_format_match_error_includes_all_failure_details() {
     let details = vec![
-        DiffMatchFailure {
-            block_number: 1,
-            block_count: 6,
-            range: None,
-        },
-        DiffMatchFailure {
-            block_number: 5,
-            block_count: 6,
-            range: Some(4..7),
-        },
-        DiffMatchFailure {
-            block_number: 6,
-            block_count: 6,
-            range: None,
-        },
+        DiffMatchFailure { block_number: 1 },
+        DiffMatchFailure { block_number: 5 },
+        DiffMatchFailure { block_number: 6 },
     ];
     let err = DiffApplicationError::UnmatchedDiffs {
         file: "file.txt".to_string(),
@@ -737,9 +716,9 @@ fn test_format_match_error_includes_all_failure_details() {
     };
 
     let message = err.to_conversation_message();
-    assert!(message.contains("Search block 1 of 6."));
-    assert!(message.contains("Search block 5 of 6 (expected lines 4-6)."));
-    assert!(message.contains("Search block 6 of 6."));
+    assert!(message.contains("Search block 1."));
+    assert!(message.contains("Search block 5."));
+    assert!(message.contains("Search block 6."));
     assert!(!message.contains("more failed diff"));
     assert!(!message.contains("Search:"));
 }
@@ -756,18 +735,14 @@ fn test_format_multiple_errors() {
                 fuzzy_match_failures: 1,
                 noop_deltas: 0,
                 missing_line_numbers: 0,
-                fuzzy_match_failure_details: vec![DiffMatchFailure {
-                    block_number: 1,
-                    block_count: 1,
-                    range: None,
-                }],
+                fuzzy_match_failure_details: vec![DiffMatchFailure { block_number: 1 }],
             },
         },
     ];
 
     assert_eq!(
         DiffApplicationError::error_for_conversation(&errs),
-        "* missing.rs does not exist. Is the path correct?\n* Could not apply all diffs to unmatched.rs. The following search blocks did not match the current file contents:\nSearch block 1 of 1."
+        "* missing.rs does not exist. Is the path correct?\n* Could not apply all diffs to unmatched.rs. The following search blocks did not match the current file contents:\nSearch block 1."
     );
 }
 
