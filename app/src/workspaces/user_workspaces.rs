@@ -73,6 +73,8 @@ pub enum UserWorkspacesEvent {
     TransferTeamOwnershipRejected(anyhow::Error),
     SetTeamMemberRoleSuccess,
     SetTeamMemberRoleRejected(anyhow::Error),
+    RemoveUserFromTeamSuccess,
+    RemoveUserFromTeamRejected(anyhow::Error),
     UpdateWorkspaceSettingsSuccess,
     UpdateWorkspaceSettingsRejected(anyhow::Error),
     AiOveragesUpdated,
@@ -1168,6 +1170,21 @@ impl UserWorkspaces {
         self.notify_and_emit_teams_changed(ctx);
     }
 
+    fn on_remove_user_from_team(
+        &mut self,
+        result: Result<WorkspacesMetadataWithPricing>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        match result {
+            Err(err) => ctx.emit(UserWorkspacesEvent::RemoveUserFromTeamRejected(err)),
+            Ok(result) => {
+                self.on_workspaces_updated(Ok(result), ctx);
+                ctx.emit(UserWorkspacesEvent::RemoveUserFromTeamSuccess);
+            }
+        };
+        ctx.notify();
+    }
+
     pub fn remove_user_from_team(
         &mut self,
         user_uid: UserUid,
@@ -1182,7 +1199,7 @@ impl UserWorkspaces {
                     .remove_user_from_team(user_uid, team_uid, entrypoint)
                     .await
             },
-            Self::on_workspaces_updated,
+            Self::on_remove_user_from_team,
         );
     }
 

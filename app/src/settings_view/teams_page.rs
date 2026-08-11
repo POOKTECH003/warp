@@ -1042,6 +1042,17 @@ impl TeamsPageView {
             UserWorkspacesEvent::SetTeamMemberRoleRejected(err) => {
                 self.show_error("Failed to update team member role", Some(err), ctx);
             }
+            UserWorkspacesEvent::RemoveUserFromTeamSuccess => {
+                self.update_team_members_state(ctx);
+                self.show_success("Removed team member", ctx);
+            }
+            UserWorkspacesEvent::RemoveUserFromTeamRejected(err) => {
+                self.show_error(
+                    format!("Failed to remove team member: {err}"),
+                    Some(err),
+                    ctx,
+                );
+            }
             UserWorkspacesEvent::UpdateWorkspaceSettingsSuccess => {
                 // as of right now, this is only emitted on the billing & usage page
             }
