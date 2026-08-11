@@ -2642,7 +2642,7 @@ fn drain_family_events_primary_routes_mixed_batch_and_delivers_inbox() {
                 ctx,
             );
             assert!(
-                tracker.has_in_flight_fetch(&child_a),
+                tracker.is_awaiting_metadata(&child_a),
                 "ChildStarted / ChildLifecycle must route into the tracker"
             );
             assert_eq!(
@@ -2651,7 +2651,7 @@ fn drain_family_events_primary_routes_mixed_batch_and_delivers_inbox() {
                 "a Started followed by Lifecycle for the same run must fetch once"
             );
             assert!(
-                !tracker.has_in_flight_fetch(&child_b),
+                !tracker.is_awaiting_metadata(&child_b),
                 "an Opaque event must not touch the tracker"
             );
         });
@@ -2726,7 +2726,7 @@ fn drain_family_events_observer_advances_cursor_without_server_push() {
                 ctx,
             );
             assert!(
-                tracker.has_in_flight_fetch(&child),
+                tracker.is_awaiting_metadata(&child),
                 "child lifecycle must route into the Observer tracker"
             );
         });

@@ -8,19 +8,30 @@ answers two questions for any orchestrator the user has open:
 1. **Which children exist?** — discovery.
 2. **What should this child's pane show right now?** — materialization.
 
+**The concrete problem this work addresses:** when a cloud-hosted orchestrator
+calls `run_agents`, the children execute in a separate sandbox that the local
+Warp client never created. For a shared-session viewer of that orchestrator the
+client's process also never created the children. In both cases the children
+must be discovered by the client rather than found in its local state.
+
 It solves two problems:
 
-**(a) Real-time child discovery during a live run.** A child can be created by
-any path — the parent's own `run_agents` tool call, the Oz CLI, the web API, or
-another client. The client learns about every one of them from a single
-server-sent event stream on the parent's run, with no polling, and surfaces
-each child as a named pill with live status.
+**(a) Real-time child discovery during a live run.** The client discovers every
+child from a single server-sent event stream on the parent's run — regardless
+of which process created the child — with no polling, surfacing each as a named
+pill with live status.
 
 **(b) Restore of the pill bar and child panes after a restart.** Cloud child
 runs and shared-session parent views are ephemeral cloud state and are
 deliberately not written to the local database. After a restart the client
 rebuilds the parent→child relationship from the server's ancestor listing and
 re-materializes child panes through the same dispatch used during a live run.
+
+**M1 scope.** This PR establishes the core machinery: the family-stream
+classification (`drain_family_events`, `classify_family_event`) that routes SSE
+events to the right handler, and the `OrchestrationChildTracker` that manages
+per-child state. Pane materialization and the restore seed path land in M2,
+which builds directly on this foundation.
 
 Everything below is gated by `FeatureFlag::OrchestrationUnifiedStack`
 (`crates/warp_features/src/lib.rs:715`, listed in `DOGFOOD_FLAGS`). With the
@@ -163,9 +174,8 @@ the signal:
   `Started` / `Lifecycle` signals for it become plain status updates.
 
 `TrackedChild` holds exactly what the state machine needs: `session_id`
-(`None` until execution is claimed), `last_state`, `pane_materialized`, and
-`is_remote_child`. `ChildSpawned` is emitted exactly once per child, from
-`insert_child`.
+(`None` until execution is claimed), `last_state`, and `is_remote_child`.
+`ChildSpawned` is emitted exactly once per child, from `insert_child`.
 
 All tracker metadata fetches route through
 `AgentConversationsModel::get_or_async_fetch_task_data`, which is the single

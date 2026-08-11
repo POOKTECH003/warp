@@ -1,11 +1,15 @@
-//! Guides child runs from first discovery through to pane materialization.
+//! Tracks child run state for one parent family.
 //!
 //! When the parent's SSE stream fires a `child_agent_started` event, the
-//! tracker creates a local placeholder, fetches the child's task metadata,
-//! waits for the sandbox session to be linked, and then requests a live or
-//! transcript pane. Every signal a child can produce — discovery, lifecycle,
-//! session links, REST seed rows, and in-band registrations — enters through
-//! the single [`OrchestrationChildTracker::observe_child`] entry point.
+//! tracker creates a local placeholder and fetches the child's task metadata.
+//! It also records session links and lifecycle transitions as they arrive.
+//! Every signal a child can produce — discovery, lifecycle, session links,
+//! REST seed rows, and in-band registrations — enters through the single
+//! [`OrchestrationChildTracker::observe_child`] entry point.
+//!
+//! Pane materialization (deciding whether a child pane should live-attach or
+//! load a transcript) is handled downstream by M2's `PaneGroup` hydration
+//! path, which is independent of this tracker.
 //!
 //! Pill-bar broadcasts (`ChildSpawned` / `ChildStatusChanged`) are emitted
 //! via the `ctx` so downstream views can react without polling.
@@ -62,8 +66,6 @@ pub struct TrackedChild {
     pub session_id: Option<SessionId>,
     /// Last observed task state, when known (seeded/refetched rows).
     pub last_state: Option<AmbientAgentTaskState>,
-    /// True once pane materialization has been requested for this child.
-    pub pane_materialized: bool,
     /// `true` for every placeholder the tracker materializes on behalf of a
     /// run hosted elsewhere. `false` only for in-band children, which already
     /// own a real local conversation and are tracked for status only.
@@ -83,9 +85,10 @@ pub struct OrchestrationChildTracker {
     /// observed for status only: their conversation and session are assigned
     /// elsewhere, so no discovery fetch is ever issued on their behalf.
     in_band_children: HashSet<AmbientAgentTaskId>,
-    /// In-flight metadata fetches keyed by `run_id`. A second discovery signal
-    /// for a run already being fetched is a no-op.
-    metadata_fetches: HashSet<String>,
+    /// Runs whose metadata has been requested but not yet applied to a
+    /// placeholder. A second discovery signal for a run in this set re-checks
+    /// the cache rather than issuing a duplicate fetch.
+    children_awaiting_metadata: HashSet<String>,
     /// Session ids delivered by `run_session_linked` before the child's
     /// placeholder exists; applied when the child is created.
     pending_session_ids: HashMap<AmbientAgentTaskId, SessionId>,
@@ -103,7 +106,7 @@ impl OrchestrationChildTracker {
             children: HashMap::new(),
             children_by_run_id: HashMap::new(),
             in_band_children: HashSet::new(),
-            metadata_fetches: HashSet::new(),
+            children_awaiting_metadata: HashSet::new(),
             pending_session_ids: HashMap::new(),
             #[cfg(test)]
             metadata_fetch_dispatch_count: 0,
@@ -171,7 +174,6 @@ impl OrchestrationChildTracker {
         if self.children.contains_key(&task_id) {
             // Already represented; keep hydrating if not yet complete.
             self.refetch_metadata_if_incomplete(task_id, run_id, ctx);
-            self.maybe_request_pane_materialization(task_id, ctx);
             return;
         }
         // New out-of-band child: start (or dedupe) discovery. The placeholder
@@ -225,12 +227,11 @@ impl OrchestrationChildTracker {
                 status,
             });
             self.refetch_metadata_if_incomplete(task_id, run_id, ctx);
-            self.maybe_request_pane_materialization(task_id, ctx);
             return;
         }
         // Lifecycle for an unknown run: only self-heal a real discovery miss,
-        // not a run whose fetch is already in flight.
-        if !self.metadata_fetches.contains(run_id) {
+        // not a run whose metadata is already pending.
+        if !self.children_awaiting_metadata.contains(run_id) {
             self.spawn_metadata_fetch(task_id, run_id, ctx);
         }
     }
@@ -246,8 +247,8 @@ impl OrchestrationChildTracker {
         ctx: &mut ModelContext<OrchestrationEventStreamer>,
     ) {
         // A real conversation already exists for this run, so any speculative
-        // discovery fetch is moot.
-        self.metadata_fetches.remove(run_id);
+        // metadata fetch is moot.
+        self.children_awaiting_metadata.remove(run_id);
         self.in_band_children.insert(task_id);
         if self.children.contains_key(&task_id) {
             return;
@@ -259,15 +260,12 @@ impl OrchestrationChildTracker {
             TrackedChild {
                 session_id,
                 last_state: None,
-                pane_materialized: false,
                 // In-band children own a real local conversation; they are
                 // never persisted as `is_remote_child` placeholders.
                 is_remote_child: false,
             },
             ctx,
         );
-        // If the session link already arrived, hydrate the pane immediately.
-        self.maybe_request_pane_materialization(task_id, ctx);
     }
 
     /// Applies a REST seed / restore row. Creates the placeholder if new and
@@ -290,14 +288,13 @@ impl OrchestrationChildTracker {
             .and_then(|s| s.parse::<SessionId>().ok());
         let state = task.state.clone();
 
-        self.metadata_fetches.remove(&run_id);
+        self.children_awaiting_metadata.remove(&run_id);
 
         if let Some(existing) = self.children.get_mut(&task_id) {
             existing.last_state = Some(state);
             if existing.session_id.is_none() {
                 existing.session_id = seed_session_id;
             }
-            self.maybe_request_pane_materialization(task_id, ctx);
             return;
         }
 
@@ -310,12 +307,10 @@ impl OrchestrationChildTracker {
             TrackedChild {
                 session_id,
                 last_state: Some(state),
-                pane_materialized: false,
                 is_remote_child: true,
             },
             ctx,
         );
-        self.maybe_request_pane_materialization(task_id, ctx);
     }
 
     /// Handles `run_session_linked`: fills in `session_id` directly (no
@@ -336,9 +331,6 @@ impl OrchestrationChildTracker {
                 if child.session_id.is_none() {
                     child.session_id = Some(session_id);
                 }
-                // Request the live pane now that the session is known,
-                // bypassing the metadata-fetch round-trip.
-                self.request_pane_materialization(task_id);
             }
             None => {
                 self.pending_session_ids.insert(task_id, session_id);
@@ -346,8 +338,8 @@ impl OrchestrationChildTracker {
         }
     }
 
-    /// Refetches metadata while `session_id` is missing or the pane has not
-    /// been materialized. No-op once the child is fully hydrated.
+    /// Refetches metadata while `session_id` is still missing. No-op once
+    /// the session id is known or the child is in-band.
     fn refetch_metadata_if_incomplete(
         &mut self,
         task_id: AmbientAgentTaskId,
@@ -358,35 +350,12 @@ impl OrchestrationChildTracker {
         if self.in_band_children.contains(&task_id) {
             return;
         }
-        let incomplete = self
+        let needs_session = self
             .children
             .get(&task_id)
-            .is_some_and(|child| child.session_id.is_none() || !child.pane_materialized);
-        if incomplete {
+            .is_some_and(|child| child.session_id.is_none());
+        if needs_session {
             self.spawn_metadata_fetch(task_id, run_id, ctx);
-        }
-    }
-
-    /// Requests pane materialization once a `session_id` is known and no pane
-    /// has been requested yet.
-    fn maybe_request_pane_materialization(
-        &mut self,
-        task_id: AmbientAgentTaskId,
-        _ctx: &mut ModelContext<OrchestrationEventStreamer>,
-    ) {
-        let should_request = self
-            .children
-            .get(&task_id)
-            .is_some_and(|child| child.session_id.is_some() && !child.pane_materialized);
-        if should_request {
-            self.request_pane_materialization(task_id);
-        }
-    }
-
-    /// Marks the child's pane as materialized.
-    fn request_pane_materialization(&mut self, task_id: AmbientAgentTaskId) {
-        if let Some(child) = self.children.get_mut(&task_id) {
-            child.pane_materialized = true;
         }
     }
 
@@ -407,31 +376,30 @@ impl OrchestrationChildTracker {
         });
     }
 
-    /// Starts (or dedupes) a metadata fetch for a run. A synchronous cache hit
-    /// resolves the placeholder inline via [`Self::apply_seeded`]; a miss
-    /// leaves the `metadata_fetches` guard set so redundant dispatches are
-    /// suppressed until a later signal re-drives discovery against a warm
-    /// cache.
+    /// Requests metadata for a run, deduplicating concurrent calls. A
+    /// synchronous cache hit resolves the placeholder inline via
+    /// [`Self::apply_seeded`]; a miss records the run in
+    /// `children_awaiting_metadata` and lets the shared in-flight fetch
+    /// deliver it later via a `TasksUpdated` re-drive.
     ///
-    /// The guard is inserted before dispatching so both the inline cache-hit
-    /// path (which clears it) and the in-flight path behave correctly.
+    /// The pending-set entry is inserted before dispatching so both the
+    /// cache-hit path (which removes it) and the miss path behave correctly.
     fn spawn_metadata_fetch(
         &mut self,
         task_id: AmbientAgentTaskId,
         run_id: &str,
         ctx: &mut ModelContext<OrchestrationEventStreamer>,
     ) {
-        if !self.metadata_fetches.insert(run_id.to_string()) {
-            // A prior dispatch set the guard. If that fetch has since
-            // completed the cache is warm and returns the task synchronously;
-            // otherwise the shared fetch dedupes the network request.
+        if !self.children_awaiting_metadata.insert(run_id.to_string()) {
+            // Metadata was already requested. If the fetch completed the cache
+            // is warm; otherwise the in-flight request is still pending.
             #[cfg(not(test))]
             {
                 let cached = AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
                     model.get_or_async_fetch_task_data(&task_id, ctx)
                 });
                 if let Some(task) = cached {
-                    self.metadata_fetches.remove(run_id);
+                    self.children_awaiting_metadata.remove(run_id);
                     self.apply_seeded(task, ctx);
                 }
             }
@@ -465,7 +433,7 @@ impl OrchestrationChildTracker {
 
     /// Drops all tracked state for a run (tombstone / kill path).
     fn forget_run(&mut self, run_id: &str) {
-        self.metadata_fetches.remove(run_id);
+        self.children_awaiting_metadata.remove(run_id);
         if let Some(task_id) = self.children_by_run_id.remove(run_id) {
             self.children.remove(&task_id);
             self.in_band_children.remove(&task_id);
@@ -479,10 +447,11 @@ impl OrchestrationChildTracker {
         self.metadata_fetch_dispatch_count
     }
 
-    /// Test-only: whether a metadata fetch is currently in flight for `run_id`.
+    /// Test-only: whether metadata has been requested but not yet applied for
+    /// `run_id`.
     #[cfg(test)]
-    pub(crate) fn has_in_flight_fetch(&self, run_id: &str) -> bool {
-        self.metadata_fetches.contains(run_id)
+    pub(crate) fn is_awaiting_metadata(&self, run_id: &str) -> bool {
+        self.children_awaiting_metadata.contains(run_id)
     }
 }
 

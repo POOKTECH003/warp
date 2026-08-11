@@ -89,8 +89,8 @@ fn started_dispatches_metadata_fetch_before_creating_placeholder() {
         tracker.observe_child(CHILD_RUN_ID, ChildSignal::Started, &no_kills(), ctx);
 
         assert!(
-            tracker.has_in_flight_fetch(CHILD_RUN_ID),
-            "discovery must start a metadata fetch"
+            tracker.is_awaiting_metadata(CHILD_RUN_ID),
+            "discovery must mark the run as awaiting metadata"
         );
         assert!(
             tracker.children.is_empty(),
@@ -202,7 +202,7 @@ fn started_after_registered_keeps_the_child_and_skips_discovery() {
 }
 
 #[test]
-fn session_linked_materializes_the_pane_without_a_metadata_fetch() {
+fn session_linked_records_the_session_id_without_a_metadata_fetch() {
     with_tracker(|tracker, ctx| {
         tracker.observe_child(CHILD_RUN_ID, ChildSignal::Registered, &no_kills(), ctx);
 
@@ -221,16 +221,13 @@ fn session_linked_materializes_the_pane_without_a_metadata_fetch() {
             .expect("child is tracked");
         assert_eq!(
             child.session_id,
-            Some(SESSION_UUID.parse().expect("hardcoded session id parses"))
-        );
-        assert!(
-            child.pane_materialized,
-            "a linked session is enough to open the pane"
+            Some(SESSION_UUID.parse().expect("hardcoded session id parses")),
+            "session id is recorded immediately from the session-linked event"
         );
         assert_eq!(
             tracker.metadata_fetch_dispatch_count(),
             0,
-            "the session link carries everything the pane needs"
+            "the session link carries everything the tracker needs"
         );
     });
 }
