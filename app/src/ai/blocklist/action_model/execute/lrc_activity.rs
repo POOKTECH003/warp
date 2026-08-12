@@ -374,7 +374,6 @@ impl BlockActivity {
         }
 
         if let Some(process) = sample.process {
-            let previous_count = self.process.live_process_count;
             let mut cpu_ms_by_pid = HashMap::with_capacity(process.per_pid.len());
             let mut io_write_bytes_by_pid = HashMap::with_capacity(process.per_pid.len());
             let mut cpu_delta = 0u64;
@@ -392,6 +391,10 @@ impl BlockActivity {
                 cpu_ms_by_pid.insert(pid_sample.pid, pid_sample.cpu_ms);
                 io_write_bytes_by_pid.insert(pid_sample.pid, pid_sample.io_write_bytes);
             }
+            let pid_set_changed = cpu_ms_by_pid.len() != self.process.cpu_ms_by_pid.len()
+                || cpu_ms_by_pid
+                    .keys()
+                    .any(|pid| !self.process.cpu_ms_by_pid.contains_key(pid));
 
             self.process.cpu_ms_by_pid = cpu_ms_by_pid;
             self.process.io_write_bytes_by_pid = io_write_bytes_by_pid;
@@ -403,8 +406,7 @@ impl BlockActivity {
 
             // Process churn is itself progress: a build spawning and reaping
             // compilers may never accumulate much CPU in any single process.
-            let count_changed = self.process.live_process_count != previous_count;
-            saw_activity |= cpu_delta > 0 || io_delta > 0 || count_changed;
+            saw_activity |= cpu_delta > 0 || io_delta > 0 || pid_set_changed;
         }
 
         for (file, size) in self.files.iter_mut().zip(sample.file_sizes) {
@@ -444,7 +446,11 @@ impl BlockActivity {
                     path: file.path.to_string_lossy().into_owned(),
                     size_bytes: size,
                     size_delta_bytes: size as i64 - file.size_at_last_report as i64,
-                    tail: read_tail(&file.path),
+                    tail: if is_log_file(&file.path) {
+                        read_tail(&file.path)
+                    } else {
+                        String::new()
+                    },
                 };
                 file.size_at_last_report = size;
                 Some(activity)
@@ -529,6 +535,11 @@ fn file_size(path: &Path) -> Option<u64> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
     metadata.is_file().then_some(metadata.len())
 }
+fn is_log_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("log"))
+}
 
 /// Reads the tail of `path` and redacts any secrets in it.
 fn read_and_redact_tail(path: &Path) -> String {
@@ -541,6 +552,9 @@ fn read_and_redact_tail(path: &Path) -> String {
 
 fn read_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
 
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
