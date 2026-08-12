@@ -670,7 +670,8 @@ fn test_create_edit_for_existing_file_directs_model_to_read_first() {
             DiffApplicationError::error_for_conversation(&errors),
             format!(
                 "{file_path} already exists (2 lines); nothing was written. Read the file first \
-                 before editing it. Do not delete and recreate it."
+                 then retry. Do not delete the file or rewrite it via shell \
+                 redirection."
             )
         );
     });
@@ -824,6 +825,9 @@ fn test_create_edit_with_observed_content_becomes_a_full_replacement() {
                 "Overwrote existing {file_path} (3 lines replaced)."
             )]
         );
+        assert_eq!(applied.overwrites.len(), 1);
+        assert_eq!(applied.overwrites[0].file_path, file_path);
+        assert_eq!(applied.overwrites[0].replaced_line_count, 3);
         assert_eq!(applied.diffs.len(), 1);
         assert_eq!(applied.diffs[0].file_name, file_path);
         assert_eq!(applied.diffs[0].original_content, existing);
@@ -840,7 +844,7 @@ fn test_create_edit_with_stale_observed_content_errors() {
     App::test((), |app| async move {
         let mut temp_file = NamedTempFile::new().expect("Failed to create temporary file");
         let file_path = temp_file.path().to_string_lossy().to_string();
-        write!(&mut temp_file, "content changed since the read\n").unwrap();
+        writeln!(&mut temp_file, "content changed since the read").unwrap();
 
         // The conversation observed an older version of the file, so the overwrite is blind
         // with respect to what is on disk now.

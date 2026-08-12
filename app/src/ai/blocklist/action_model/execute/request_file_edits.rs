@@ -52,6 +52,10 @@ pub struct RequestFileEditsExecutor {
     /// Whole-file contents the model authored per pending action (creations and full
     /// replacements), recorded as observed once the action succeeds without user edits.
     pending_authored_contents: HashMap<AIAgentActionId, Vec<(String, ContentFingerprint)>>,
+    /// Absolutized paths of coerced create-file overwrites per pending action, with each file's
+    /// replaced line count; used to elide large replaced bodies from the model-facing result
+    /// diff.
+    pending_overwrites: HashMap<AIAgentActionId, Vec<(String, usize)>>,
     terminal_view_id: EntityId,
 }
 
@@ -69,6 +73,7 @@ impl RequestFileEditsExecutor {
             diff_application_failures: HashMap::new(),
             pending_notes: HashMap::new(),
             pending_authored_contents: HashMap::new(),
+            pending_overwrites: HashMap::new(),
             terminal_view_id,
         }
     }
@@ -141,6 +146,7 @@ impl RequestFileEditsExecutor {
         self.diff_application_failures.remove(action_id);
         self.pending_notes.remove(action_id);
         self.pending_authored_contents.remove(action_id);
+        self.pending_overwrites.remove(action_id);
     }
 
     pub(super) fn execute(
@@ -194,9 +200,11 @@ impl RequestFileEditsExecutor {
             .pending_authored_contents
             .remove(id)
             .unwrap_or_default();
+        let overwrites = self.pending_overwrites.remove(id).unwrap_or_default();
 
         ActionExecution::new_async(result_future, move |mut result, ctx| {
             if let RequestFileEditsResult::Success {
+                diff,
                 updated_files,
                 lines_added,
                 lines_removed,
@@ -219,6 +227,20 @@ impl RequestFileEditsExecutor {
                 );
 
                 notes.extend(apply_notes);
+
+                // A coerced overwrite's result diff restates the old file as `-` lines the
+                // model already knows; elide large replaced bodies from the model-facing diff.
+                // The review surface keeps the full diff.
+                let elide_paths: HashSet<&str> = overwrites
+                    .iter()
+                    .filter(|(_, replaced_line_count)| {
+                        *replaced_line_count >= ELIDED_OVERWRITE_MIN_LINES
+                    })
+                    .map(|(path, _)| path.as_str())
+                    .collect();
+                if !elide_paths.is_empty() {
+                    *diff = elide_replaced_content(diff, &elide_paths);
+                }
 
                 // A file whose entire content the model authored is now observed content —
                 // unless the user hand-edited it during review, in which case the model no
@@ -346,9 +368,15 @@ impl RequestFileEditsExecutor {
 
         let shell_launch_data = self.active_session.as_ref(ctx).shell_launch_data(ctx);
 
-        let mut diffs = Vec::with_capacity(applied_edits.diffs.len());
+        let AppliedEdits {
+            diffs: edit_diffs,
+            notes: apply_notes,
+            overwrites,
+        } = applied_edits;
+
+        let mut diffs = Vec::with_capacity(edit_diffs.len());
         let mut authored_contents = Vec::new();
-        for diff in applied_edits.diffs {
+        for diff in edit_diffs {
             let path = host_native_absolute_path(
                 diff.file_name.as_str(),
                 &shell_launch_data,
@@ -368,12 +396,30 @@ impl RequestFileEditsExecutor {
             let file_diff = FileDiff::new(diff.original_content, path, diff.diff_type);
             diffs.push(file_diff);
         }
-        if !applied_edits.notes.is_empty() {
-            self.pending_notes.insert(id.clone(), applied_edits.notes);
+        if !apply_notes.is_empty() {
+            self.pending_notes.insert(id.clone(), apply_notes);
         }
         if !authored_contents.is_empty() {
             self.pending_authored_contents
                 .insert(id.clone(), authored_contents);
+        }
+        // Result diffs are keyed by absolutized paths, so absolutize the overwrite paths they
+        // will be matched against.
+        let overwrites: Vec<(String, usize)> = overwrites
+            .into_iter()
+            .map(|overwrite| {
+                (
+                    host_native_absolute_path(
+                        &overwrite.file_path,
+                        &shell_launch_data,
+                        &current_working_directory,
+                    ),
+                    overwrite.replaced_line_count,
+                )
+            })
+            .collect();
+        if !overwrites.is_empty() {
+            self.pending_overwrites.insert(id.clone(), overwrites);
         }
 
         // Set the session type so save/delete/create routes through the
@@ -450,6 +496,57 @@ fn is_full_file_range(range: &Range<usize>, original_content: &str) -> bool {
     } else {
         *range == (1..line_count.saturating_add(1))
     }
+}
+
+/// Replaced files at or above this many lines have their deletion bodies elided from the
+/// model-facing result diff. Below this, restating the old content is cheap enough that
+/// rewriting the diff isn't worth it.
+const ELIDED_OVERWRITE_MIN_LINES: usize = 100;
+
+/// Collapses each run of deleted lines in the unified-diff sections for `elide_paths` into a
+/// one-line `[- N lines replaced -]` marker.
+///
+/// The rewritten diff is informational (it accompanies an already-applied edit); hunk headers
+/// are left untouched, so the output is not reapplicable.
+fn elide_replaced_content(diff: &str, elide_paths: &HashSet<&str>) -> String {
+    fn flush_deletions(output: &mut Vec<String>, pending_deletions: &mut usize) {
+        if *pending_deletions > 0 {
+            output.push(format!("[- {pending_deletions} lines replaced -]"));
+            *pending_deletions = 0;
+        }
+    }
+
+    let mut output: Vec<String> = Vec::new();
+    let mut in_elided_section = false;
+    let mut pending_deletions = 0usize;
+
+    let mut lines = diff.lines().peekable();
+    while let Some(line) = lines.next() {
+        if let Some(header_path) = line.strip_prefix("--- ")
+            && lines
+                .peek()
+                .is_some_and(|next| next.strip_prefix("+++ ") == Some(header_path))
+        {
+            flush_deletions(&mut output, &mut pending_deletions);
+            in_elided_section = elide_paths.contains(header_path);
+            output.push(line.to_string());
+            output.push(lines.next().expect("peeked header line").to_string());
+            continue;
+        }
+        if in_elided_section && line.starts_with('-') {
+            pending_deletions += 1;
+            continue;
+        }
+        flush_deletions(&mut output, &mut pending_deletions);
+        output.push(line.to_string());
+    }
+    flush_deletions(&mut output, &mut pending_deletions);
+
+    let mut elided = output.join("\n");
+    if diff.ends_with('\n') {
+        elided.push('\n');
+    }
+    elided
 }
 
 impl Entity for RequestFileEditsExecutor {

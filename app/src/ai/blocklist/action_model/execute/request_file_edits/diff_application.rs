@@ -121,7 +121,9 @@ impl DiffApplicationError {
             DiffApplicationError::AlreadyExists { file, line_count } => {
                 format!(
                     "{file} already exists ({line_count} lines); nothing was written. Read the \
-                     file first before editing it. Do not delete and recreate it."
+                     whole file, then retry: after a full read, this same create_file request \
+                     will replace the file's contents. Do not delete the file or rewrite it via \
+                     shell redirection."
                 )
             }
             DiffApplicationError::ReadFailed { file, .. } => {
@@ -165,6 +167,17 @@ pub(crate) struct AppliedEdits {
     /// Human/model-facing notices about how edits were applied (e.g. a create coerced into an
     /// overwrite), surfaced in the action result on acceptance.
     pub(crate) notes: Vec<String>,
+    /// Create-file requests that were coerced into informed full-content replacements.
+    pub(crate) overwrites: Vec<CoercedOverwrite>,
+}
+
+/// A create-file request applied as a full-content replacement of an existing file whose content
+/// the conversation had observed.
+#[derive(Debug)]
+pub(crate) struct CoercedOverwrite {
+    /// The file path as the model requested it (not absolutized).
+    pub(crate) file_path: String,
+    pub(crate) replaced_line_count: usize,
 }
 
 /// Given a list of suggested edits from the server API, parse it into applicable diffs to be shown
@@ -175,6 +188,7 @@ pub(crate) struct AppliedEdits {
 ///   existing content (per `observed`), in which case the create is applied as a full replacement
 ///
 /// Errors are reported as telemetry, and also returned for display.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_edits<F, Fut>(
     edits: Vec<FileEdit>,
     session_context: &SessionContext,
@@ -261,6 +275,7 @@ where
         Err(vec1::Size0Error) => Ok(AppliedEdits {
             diffs: result.diffs,
             notes: result.notes,
+            overwrites: result.overwrites,
         }),
     }
 }
@@ -286,6 +301,8 @@ struct DiffResult {
     warnings: Vec<DiffWarning>,
     /// Notices about how edits were applied, surfaced in the action result on acceptance.
     notes: Vec<String>,
+    /// Create-file requests coerced into informed full-content replacements.
+    overwrites: Vec<CoercedOverwrite>,
 }
 
 /// You generally want to use `apply_edits`, however, if you don't want to report telemetry or be as
@@ -552,10 +569,14 @@ async fn apply_create_file<F, Fut>(
         FileReadResult::Found(existing_content)
             if observed.contains(&absolute_path, ContentFingerprint::of(&existing_content)) =>
         {
+            let replaced_line_count = existing_content.lines().count();
             result.notes.push(format!(
-                "Overwrote existing {file_path} ({} lines replaced).",
-                existing_content.lines().count()
+                "Overwrote existing {file_path} ({replaced_line_count} lines replaced)."
             ));
+            result.overwrites.push(CoercedOverwrite {
+                file_path: file_path.clone(),
+                replaced_line_count,
+            });
             result
                 .diffs
                 .push(full_replacement_diff(file_path, existing_content, content));

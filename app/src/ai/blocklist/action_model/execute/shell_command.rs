@@ -26,6 +26,7 @@ use crate::ai::agent::{
 use crate::ai::blocklist::BlocklistAIPermissions;
 use crate::ai::blocklist::action_model::recording_controller::RecordingController;
 use crate::ai::blocklist::permissions::CommandExecutionPermission;
+use crate::ai::blocklist::shell_file_observations::credit_command_file_observations;
 use crate::ai::execution_profiles::WriteToPtyPermission;
 use crate::terminal::TerminalModel;
 use crate::terminal::event::BlockMetadataReceivedEvent;
@@ -324,6 +325,19 @@ impl ShellCommandExecutor {
                 let command = command.clone();
                 drop(model);
 
+                let shell_launch_data = self.active_session.as_ref(ctx).shell_launch_data(ctx);
+                let current_working_directory = self
+                    .active_session
+                    .as_ref(ctx)
+                    .current_working_directory()
+                    .cloned();
+                // Remote sessions execute against a filesystem this process cannot
+                // read, so shell-observation crediting is local-only.
+                let is_local_session = matches!(
+                    self.active_session.as_ref(ctx).session_type(ctx),
+                    Some(SessionType::Local) | None
+                );
+
                 ActionExecution::new_async(
                     self.action_result_future(block_selector.clone(), None, ctx),
                     move |result, ctx| {
@@ -351,6 +365,26 @@ impl ShellCommandExecutor {
                                     ActionResult::LongRunningCommandSnapshot { .. } => {}
                                 }
                             });
+                        }
+
+                        // A completed local command may have verifiably shown the model a
+                        // file's exact content (whole-file `cat`) or written model-authored
+                        // content (`>` redirect, heredoc, `tee`); credit those observations
+                        // so a later create_file over the same path is an informed overwrite.
+                        if is_local_session
+                            && let ActionResult::CommandFinished {
+                                output, exit_code, ..
+                            } = &result
+                            && exit_code.value() == 0
+                        {
+                            credit_command_file_observations(
+                                conversation_id,
+                                &command,
+                                output,
+                                &shell_launch_data,
+                                &current_working_directory,
+                                ctx,
+                            );
                         }
 
                         action_result_for_requested_command(command, result)
