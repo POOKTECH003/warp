@@ -1935,6 +1935,7 @@ impl AIBlock {
                     let output = output.get();
                     self.handle_updated_output(&output, ctx);
                 }
+                self.notify_run_agents_card_views(ctx);
                 self.spawn_link_detection(ctx);
                 self.finish(FinishReason::Cancelled, ctx);
 
@@ -1972,6 +1973,7 @@ impl AIBlock {
                 );
                 self.maybe_create_aws_bedrock_credentials_error_view(&error, ctx);
                 self.maybe_create_gemini_enterprise_credentials_error_view(&error, ctx);
+                self.notify_run_agents_card_views(ctx);
                 // There are no actions to be taken in this block, it is finished.
                 self.finish(FinishReason::Error, ctx);
             }
@@ -7233,6 +7235,17 @@ impl AIBlock {
             }
         });
         self.run_agents_card_views.insert(action_id.clone(), view);
+    }
+
+    /// Re-renders the orchestrate cards after the block's output stream ends
+    /// without succeeding. A `RunAgents` tool call that was still streaming at
+    /// that point never reaches the action queue, so it produces no action
+    /// result and no event of its own; without this nudge its card would keep
+    /// rendering the "Configuring agents…" placeholder forever.
+    fn notify_run_agents_card_views(&self, ctx: &mut ViewContext<Self>) {
+        for view in self.run_agents_card_views.values().cloned().collect_vec() {
+            view.update(ctx, |_, ctx| ctx.notify());
+        }
     }
 }
 #[cfg(test)]
