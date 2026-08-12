@@ -23164,7 +23164,9 @@ impl TerminalView {
         let ai_block_model = Rc::new(match output {
             DummyAIBlockOutput::Complete(output) => FakeAIBlockModel::new(inputs, output),
             DummyAIBlockOutput::Streaming => FakeAIBlockModel::new_streaming(inputs),
-            DummyAIBlockOutput::Cancelled(output) => FakeAIBlockModel::new_cancelled(inputs, output),
+            DummyAIBlockOutput::Cancelled(output) => {
+                FakeAIBlockModel::new_cancelled(inputs, output)
+            }
         });
         let ai_block = ctx.add_typed_action_view(|ctx| {
             AIBlock::new(

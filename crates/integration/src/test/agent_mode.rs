@@ -235,8 +235,18 @@ pub fn test_restored_ai_block_renders_mermaid_and_local_images() -> Builder {
 pub fn test_cancelled_run_agents_card_renders_cancelled_state() -> Builder {
     new_builder()
         .with_real_display()
+        // A dummy AI block is not attached to an agent view conversation, so with
+        // `AgentView` on it is filtered out of the terminal transcript and never
+        // renders. The user preference is the only override that wins over the
+        // flag state the app installs during startup.
+        .with_step(
+            TestStep::new("Render AI blocks inline in the blocklist").with_action(|_, _, _| {
+                FeatureFlag::AgentView.set_user_preference(false);
+            }),
+        )
         .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
         .with_step(clear_blocklist_to_remove_bootstrapped_blocks())
+        .with_step(execute_echo_str(0, "orchestrate card repro"))
         .with_step(
             new_step_with_default_assertions("Insert cancelled orchestrate AI block").with_action(
                 |app, window_id, _| {
@@ -259,7 +269,7 @@ pub fn test_cancelled_run_agents_card_renders_cancelled_state() -> Builder {
         .with_step(
             TestStep::new("Capture the cancelled orchestrate card")
                 .set_timeout(Duration::from_secs(20))
-                .set_post_step_pause(Duration::from_secs(2))
+                .set_post_step_pause(Duration::from_secs(3))
                 .with_take_screenshot("run_agents_cancelled_card.png")
                 .add_assertion(|app, window_id| {
                     let terminal_view = single_terminal_view_for_tab(app, window_id, 0);
