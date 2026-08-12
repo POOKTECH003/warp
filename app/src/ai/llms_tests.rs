@@ -286,6 +286,48 @@ fn models_without_a_host_fall_back_to_the_provider_icon() {
     );
 }
 
+#[test]
+fn kimi_models_show_the_kimi_logo_despite_unknown_provider() {
+    // Kimi models are served via Fireworks, so the server reports
+    // LLMProvider::Unknown for them; the id is used to badge them instead.
+    let llm = server_llm("kimi-k26-fireworks", None);
+    assert_eq!(llm.provider, LLMProvider::Unknown);
+
+    assert_eq!(
+        model_leading_icon(&llm, ModelIconFlags::default()),
+        Icon::KimiLogo
+    );
+}
+
+#[test]
+fn non_kimi_models_are_unaffected_by_the_kimi_icon_check() {
+    let mut llm = server_llm("gpt-test", None);
+    llm.provider = LLMProvider::OpenAI;
+
+    assert_eq!(
+        model_leading_icon(&llm, ModelIconFlags::default()),
+        Icon::OpenAILogo
+    );
+}
+
+#[test]
+fn kimi_model_host_and_router_flags_still_take_priority_over_the_kimi_icon() {
+    // The Kimi check sits alongside the plain provider fallback, so higher
+    // priority flags (custom router, auto, host badges) still win.
+    let llm = server_llm("kimi-k27-code-fireworks", None);
+
+    assert_eq!(
+        model_leading_icon(
+            &llm,
+            ModelIconFlags {
+                is_using_bedrock: true,
+                ..Default::default()
+            }
+        ),
+        Icon::Aws
+    );
+}
+
 // -- build_custom_llm_infos / display label tests --
 
 fn endpoint(
