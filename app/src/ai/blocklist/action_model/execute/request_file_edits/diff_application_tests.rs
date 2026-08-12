@@ -669,9 +669,9 @@ fn test_create_edit_for_existing_file_directs_model_to_read_first() {
         assert_eq!(
             DiffApplicationError::error_for_conversation(&errors),
             format!(
-                "{file_path} already exists (2 lines); nothing was written. Read the file first \
-                 then retry. Do not delete the file or rewrite it via shell \
-                 redirection."
+                "{file_path} already exists (2 lines); nothing was written. Read the whole file, \
+                 then retry: after a full read, this same create_file request will replace the \
+                 file's contents. Do not delete the file or rewrite it via shell redirection."
             )
         );
     });
