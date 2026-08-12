@@ -647,11 +647,10 @@ fn local_to_cloud_idempotent_when_already_remote() {
 }
 
 mod is_orphaned_by_finished_output_tests {
+    use super::super::is_orphaned_by_finished_output;
     use crate::ai::agent::{AIAgentOutput, CancellationReason, RenderableAIError, Shared};
     use crate::ai::blocklist::action_model::AIActionStatus;
     use crate::ai::blocklist::block::model::AIBlockOutputStatus;
-
-    use super::super::is_orphaned_by_finished_output;
 
     fn partial_output() -> Shared<AIAgentOutput> {
         Shared::new(AIAgentOutput::default())
