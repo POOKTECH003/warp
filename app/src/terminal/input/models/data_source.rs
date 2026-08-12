@@ -30,7 +30,7 @@ use crate::ai::custom_model_routers::is_custom_router_id;
 use crate::ai::execution_profiles::model_menu_items::is_auto;
 use crate::ai::llms::{
     ByoKeySource, DisableReason, LLMId, LLMInfo, LLMPreferences, LLMProvider, LLMSpec,
-    ModelIconFlags, byo_key_source_for_model, model_leading_icon,
+    ModelIconFlags, byo_key_source_for_model, is_custom_endpoint_model, model_leading_icon,
     should_show_bedrock_icon_for_model,
     should_show_gemini_enterprise_agent_platform_icon_for_model, should_show_key_icon_for_model,
 };
@@ -386,6 +386,7 @@ impl ModelSearchItem {
             llm,
             ModelIconFlags {
                 is_custom_router,
+                is_custom_endpoint: is_custom_endpoint_model(llm, app),
                 is_auto,
                 is_using_bedrock,
                 is_using_gemini_enterprise: is_using_gemini_enterprise_agent_platform,

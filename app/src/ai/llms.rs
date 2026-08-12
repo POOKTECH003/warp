@@ -165,9 +165,19 @@ pub fn should_show_gemini_enterprise_agent_platform_icon_for_model(
     )
 }
 
+/// Returns `true` when `llm.id` identifies one of the user's own custom-endpoint
+/// models (whose id is a user-controlled `config_key`), as opposed to a
+/// first-party catalog model.
+pub fn is_custom_endpoint_model(llm: &LLMInfo, app: &AppContext) -> bool {
+    LLMPreferences::as_ref(app)
+        .custom_llm_info_for_id(&llm.id)
+        .is_some()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModelIconFlags {
     pub is_custom_router: bool,
+    pub is_custom_endpoint: bool,
     pub is_auto: bool,
     pub is_using_bedrock: bool,
     pub is_using_gemini_enterprise: bool,
@@ -186,16 +196,22 @@ pub fn model_leading_icon(llm: &LLMInfo, flags: ModelIconFlags) -> Icon {
         Icon::Aws
     } else if flags.is_using_gemini_enterprise {
         Icon::GeminiEnterpriseAgentPlatform
-    } else if is_kimi_model(llm) {
+    } else if !flags.is_custom_endpoint && is_kimi_model(llm) {
         Icon::KimiLogo
     } else {
         llm.provider.icon().unwrap_or(Icon::Agent)
     }
 }
 
-/// Returns `true` for Kimi models. These are served through Fireworks rather
-/// than a dedicated first-party provider, so they report [`LLMProvider::Unknown`]
-/// and would otherwise fall back to the generic agent glyph.
+/// Returns `true` for first-party Kimi catalog models. These are served
+/// through Fireworks rather than a dedicated first-party provider, so they
+/// report [`LLMProvider::Unknown`] and would otherwise fall back to the
+/// generic agent glyph.
+///
+/// Callers must also exclude custom-endpoint models (see
+/// [`ModelIconFlags::is_custom_endpoint`]): their id is a user-controlled
+/// `config_key` that could coincidentally start with `kimi-` without being a
+/// real Kimi model.
 fn is_kimi_model(llm: &LLMInfo) -> bool {
     llm.id.as_str().to_ascii_lowercase().starts_with("kimi-")
 }

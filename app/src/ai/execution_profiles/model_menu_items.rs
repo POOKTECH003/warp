@@ -11,7 +11,7 @@ use warpui::{Action, AppContext, Element};
 
 use crate::ai::custom_model_routers::is_custom_router_id;
 use crate::ai::llms::{
-    DisableReason, LLMId, LLMInfo, ModelIconFlags, model_leading_icon,
+    DisableReason, LLMId, LLMInfo, ModelIconFlags, is_custom_endpoint_model, model_leading_icon,
     should_show_bedrock_icon_for_model,
     should_show_gemini_enterprise_agent_platform_icon_for_model, should_show_key_icon_for_model,
 };
@@ -94,6 +94,7 @@ fn make_item_fields<A: Action + Clone>(
         llm,
         ModelIconFlags {
             is_custom_router,
+            is_custom_endpoint: is_custom_endpoint_model(llm, app),
             is_auto: is_auto_model,
             is_using_bedrock,
             is_using_gemini_enterprise: is_using_gemini_enterprise_agent_platform,

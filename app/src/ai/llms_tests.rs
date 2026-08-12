@@ -311,11 +311,33 @@ fn non_kimi_models_are_unaffected_by_the_kimi_icon_check() {
 }
 
 #[test]
-fn kimi_model_host_and_router_flags_still_take_priority_over_the_kimi_icon() {
-    // The Kimi check sits alongside the plain provider fallback, so higher
-    // priority flags (custom router, auto, host badges) still win.
+fn kimi_model_router_auto_and_host_flags_still_take_priority_over_the_kimi_icon() {
+    // The Kimi check sits alongside the plain provider fallback (last in the
+    // if/else chain), so every higher-priority flag must still win even for
+    // a Kimi id. Using non-Kimi ids elsewhere wouldn't catch a reorder that
+    // let the Kimi branch preempt these.
     let llm = server_llm("kimi-k27-code-fireworks", None);
 
+    assert_eq!(
+        model_leading_icon(
+            &llm,
+            ModelIconFlags {
+                is_custom_router: true,
+                ..Default::default()
+            }
+        ),
+        Icon::Dataflow
+    );
+    assert_eq!(
+        model_leading_icon(
+            &llm,
+            ModelIconFlags {
+                is_auto: true,
+                ..Default::default()
+            }
+        ),
+        Icon::Agent
+    );
     assert_eq!(
         model_leading_icon(
             &llm,
@@ -326,6 +348,95 @@ fn kimi_model_host_and_router_flags_still_take_priority_over_the_kimi_icon() {
         ),
         Icon::Aws
     );
+    assert_eq!(
+        model_leading_icon(
+            &llm,
+            ModelIconFlags {
+                is_using_gemini_enterprise: true,
+                ..Default::default()
+            }
+        ),
+        Icon::GeminiEnterpriseAgentPlatform
+    );
+}
+
+#[test]
+fn custom_endpoint_model_with_kimi_like_config_key_keeps_generic_treatment() {
+    // Custom-endpoint `LLMInfo.id` is the user-controlled `config_key`
+    // (see `custom_llm_info_from`), so an unrelated custom endpoint whose key
+    // happens to start with "kimi-" must NOT be misbranded with the Kimi logo.
+    let llm = server_llm("kimi-internal", None);
+
+    assert_eq!(
+        model_leading_icon(
+            &llm,
+            ModelIconFlags {
+                is_custom_endpoint: true,
+                ..Default::default()
+            }
+        ),
+        Icon::Agent
+    );
+}
+
+#[test]
+fn real_custom_endpoint_with_kimi_like_config_key_is_detected_and_not_misbranded() {
+    // End-to-end regression: a user-configured custom endpoint whose
+    // config_key happens to start with "kimi-" must be recognized by
+    // `is_custom_endpoint_model` and must not render the Kimi logo.
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(AuthManager::new_for_test);
+        app.add_singleton_model(|_| NetworkStatus::new());
+        app.add_singleton_model(UserWorkspaces::default_mock);
+        app.add_singleton_model(CloudModel::mock);
+        app.add_singleton_model(TeamTesterStatus::mock);
+        app.add_singleton_model(SyncQueue::mock);
+        app.add_singleton_model(UpdateManager::mock);
+        app.add_singleton_model(|_| TemplatableMCPServerManager::default());
+        app.add_singleton_model(|ctx| {
+            AIExecutionProfilesModel::new(&LaunchMode::new_for_unit_test(), ctx)
+        });
+        let llm_preferences = app.add_singleton_model(LLMPreferences::new);
+
+        ApiKeyManager::handle(&app).update(&mut app, |api_key_manager, ctx| {
+            api_key_manager.add_custom_endpoint(
+                ai::api_keys::CustomEndpointParams {
+                    name: "internal".to_string(),
+                    url: "https://example.com/v1".to_string(),
+                    api_key: "test-key".to_string(),
+                    models: vec![(
+                        "internal-model".to_string(),
+                        None,
+                        Some("kimi-internal".to_string()),
+                    )],
+                    schema: ai::api_keys::CustomEndpointSchema::default(),
+                },
+                ctx,
+            );
+        });
+
+        llm_preferences.read(&app, |preferences, ctx| {
+            let llm = preferences
+                .custom_llm_info_for_id(&LLMId::from("kimi-internal"))
+                .expect("custom endpoint model should be registered")
+                .clone();
+
+            assert!(is_custom_endpoint_model(&llm, ctx));
+            assert_eq!(
+                model_leading_icon(
+                    &llm,
+                    ModelIconFlags {
+                        is_custom_endpoint: is_custom_endpoint_model(&llm, ctx),
+                        ..Default::default()
+                    }
+                ),
+                Icon::Agent
+            );
+        });
+    });
 }
 
 // -- build_custom_llm_infos / display label tests --
