@@ -18,15 +18,21 @@ use super::{
 use crate::notebooks::NotebookId;
 use crate::server::server_api::presigned_upload::upload_to_target;
 
-/// Regression test for QUALITY-1529: the server's `send_message_to_agent` error must survive to
-/// the model verbatim, with no wrapping or truncation. `WritePlatformError` on warp-server places
-/// the fully custom message (built via `platformerrors.NewResourceNotFound`, no `detail` set) into
-/// the JSON `"error"` field; `error_from_response` deserializes that into `ClientError` whose
-/// `Display` is exactly `"{error}"` with no added text. Verifying that here means a clearer
-/// server-side error (naming the bad agent id and listing accessible agents) isn't flattened into
-/// a generic string before it reaches the model.
+/// Regression test for QUALITY-1529. This proves ONE hop of the error's path to the model: when
+/// `/api/v1/agent/messages` returns a non-2xx response whose body is `{"error": "..."}`,
+/// `ServerApi::send_agent_message`'s HTTP error handling (`error_from_response`, which deserializes
+/// into `ClientError` and whose `Display` is exactly `"{error}"`) returns that string to its caller
+/// completely unmodified - no wrapping, truncation, or re-summarization.
+///
+/// It does NOT execute `SendMessageToAgentExecutor` or a full model turn; the remaining hops -
+/// `SendMessageToAgentExecutor` converting this `anyhow::Error` into `SendMessageToAgentResult::Error`
+/// (send_message.rs), and that result being forwarded as the tool-call result on the wire
+/// (crates/ai/src/agent/action_result/convert.rs, `impl From<SendMessageToAgentResult> for
+/// api::request::input::tool_call_result::Result`) - were verified by reading that code, not by a
+/// test, since neither requires network I/O and both are simple, direct field pass-throughs with no
+/// string transformation.
 #[test]
-fn send_agent_message_error_message_survives_verbatim_to_caller() {
+fn send_agent_message_error_response_preserves_mocked_error_field_verbatim() {
     let expected_error_message = "No such agent: \"019ff635-b4f6-7043-ad21-9db79d3043b8\". \
          Agents you can currently message: \"019ff635-b4f6-7043-ad21-9db79e3043b8\".";
     let _request = {
