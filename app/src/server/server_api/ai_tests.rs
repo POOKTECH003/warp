@@ -2,20 +2,55 @@ use chrono::{TimeZone, Utc};
 use futures::executor::block_on;
 use itertools::Itertools;
 use mockito::{Matcher, Server};
+use warp_core::channel::ChannelState;
 use warp_server_client::base_client::CLOUD_AGENT_ID_HEADER;
 
 use super::super::ServerApi;
 use super::{
-    AgentMessageHeader, AgentRunEvent, AgentSource, AmbientAgentTaskState, Artifact,
+    AIClient, AgentMessageHeader, AgentRunEvent, AgentSource, AmbientAgentTaskState, Artifact,
     ArtifactDownloadResponse, ArtifactType, CONNECTED_SELF_HOSTED_WORKERS_PATH,
     ConnectedSelfHostedWorker, ExecutionLocation, ForkConversationResponse,
     ListConnectedSelfHostedWorkersResponse, ListRunsResponse, PrepareAttachmentUploadsResponse,
-    ReadAgentMessageResponse, RunFollowupRequest, RunSortBy, RunSortOrder, SpawnAgentRequest,
-    TaskListFilter, UploadFieldValue, UserQueryMode, build_fork_conversation_url,
-    build_list_agent_runs_url, build_run_followup_url,
+    ReadAgentMessageResponse, RunFollowupRequest, RunSortBy, RunSortOrder, SendAgentMessageRequest,
+    SpawnAgentRequest, TaskListFilter, UploadFieldValue, UserQueryMode,
+    build_fork_conversation_url, build_list_agent_runs_url, build_run_followup_url,
 };
 use crate::notebooks::NotebookId;
 use crate::server::server_api::presigned_upload::upload_to_target;
+
+/// Regression test for QUALITY-1529: the server's `send_message_to_agent` error must survive to
+/// the model verbatim, with no wrapping or truncation. `WritePlatformError` on warp-server places
+/// the fully custom message (built via `platformerrors.NewResourceNotFound`, no `detail` set) into
+/// the JSON `"error"` field; `error_from_response` deserializes that into `ClientError` whose
+/// `Display` is exactly `"{error}"` with no added text. Verifying that here means a clearer
+/// server-side error (naming the bad agent id and listing accessible agents) isn't flattened into
+/// a generic string before it reaches the model.
+#[test]
+fn send_agent_message_error_message_survives_verbatim_to_caller() {
+    let expected_error_message = "No such agent: \"019ff635-b4f6-7043-ad21-9db79d3043b8\". \
+         Agents you can currently message: \"019ff635-b4f6-7043-ad21-9db79e3043b8\".";
+    let _request = {
+        let mut server = ChannelState::mock_server();
+        server
+            .mock("POST", "/api/v1/agent/messages")
+            .with_status(404)
+            .with_body(serde_json::json!({ "error": expected_error_message }).to_string())
+            .create()
+    };
+
+    let server_api = ServerApi::new_for_test();
+    let request = SendAgentMessageRequest {
+        to: vec!["019ff635-b4f6-7043-ad21-9db79d3043b8".to_string()],
+        subject: "final report".to_string(),
+        body: "done".to_string(),
+        sender_run_id: "019ff6e5-93c3-7939-ba12-1bdcf8ea2b05".to_string(),
+    };
+
+    let error = block_on(server_api.send_agent_message(request)).unwrap_err();
+
+    assert_eq!(error.to_string(), expected_error_message);
+    assert!(!error.to_string().contains("no rows in result set"));
+}
 
 #[test]
 fn ambient_agent_headers_for_task_overrides_existing_cloud_agent_header() {
