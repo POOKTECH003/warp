@@ -289,7 +289,7 @@ pub struct LrcFileActivity {
     pub size_bytes: u64,
     /// Change in size since the previous snapshot.
     pub size_delta_bytes: i64,
-    /// Secret-redacted tail of the file. Empty for non-text or unreadable files.
+    /// Secret-redacted tail of a `.log` file. Empty for other, non-text, or unreadable files.
     pub tail: String,
 }
 

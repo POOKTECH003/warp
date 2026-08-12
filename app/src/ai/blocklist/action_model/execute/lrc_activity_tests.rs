@@ -291,6 +291,28 @@ fn process_churn_counts_as_activity() {
     let report = activity.take_report(start + Duration::from_secs(5), no_tail);
     assert_eq!(report.since_last_activity, Some(Duration::ZERO));
 }
+#[test]
+fn same_count_pid_replacement_counts_as_activity() {
+    let start = Instant::now();
+    let mut activity = local_activity(start);
+
+    activity.apply_sample(
+        sample(OUTPUT_A, Some(process_sample(&[(100, 500)]))),
+        start + Duration::from_secs(1),
+    );
+    activity.take_report(start + Duration::from_secs(1), no_tail);
+
+    activity.apply_sample(
+        sample(OUTPUT_A, Some(process_sample(&[(101, 500)]))),
+        start + Duration::from_secs(5),
+    );
+
+    let report = activity.take_report(start + Duration::from_secs(5), no_tail);
+    let process = report.process.expect("process tier should be reported");
+    assert_eq!(process.cpu_time_delta, Duration::ZERO);
+    assert_eq!(process.live_process_count, 1);
+    assert_eq!(report.since_last_activity, Some(Duration::ZERO));
+}
 
 #[test]
 fn file_growth_counts_as_activity() {
@@ -400,6 +422,17 @@ fn the_file_tail_is_read_only_when_a_report_is_built() {
 
     activity.take_report(start + Duration::from_secs(10), counting_tail);
     assert_eq!(reads.get(), 1);
+}
+#[test]
+fn non_log_files_do_not_have_their_tail_read() {
+    let start = Instant::now();
+    let mut activity = activity_with_files(&["/tmp/export.csv"], &[Some(10)], start);
+
+    let report = activity.take_report(start, |_| panic!("non-log files must not be read"));
+
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.files[0].size_bytes, 10);
+    assert_eq!(report.files[0].tail, "");
 }
 
 #[test]
@@ -541,6 +574,18 @@ fn file_size_does_not_follow_symlinks() {
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
     assert_eq!(file_size(&link), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_tail_does_not_follow_symlinks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let target = dir.path().join("secret.txt");
+    std::fs::write(&target, b"sensitive").expect("write");
+    let link = dir.path().join("build.log");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+    assert_eq!(read_tail(&link), None);
 }
 
 #[test]
