@@ -33,7 +33,7 @@ mod test_util;
 pub const PROMPT_CHARACTER_LIMIT: usize = 1000;
 
 pub const AI_ASSISTANT_FEATURE_NAME: &str = "Warp AI";
-pub const ASK_AI_ASSISTANT_TEXT: &str = "Ask Warp AI";
+pub const ASK_AI_ASSISTANT_TEXT: &str = "向 Warp AI 提问";
 
 pub const AI_ASSISTANT_SVG_PATH: &str = "bundled/svg/ai-assistant.svg";
 
@@ -80,14 +80,14 @@ impl From<&AskAIType> for OpenedWarpAISource {
 }
 
 pub struct AIGeneratedCommand {
-    command: String,
-    description: String,
-    parameters: Vec<AIGeneratedCommandParameter>,
+    pub command: String,
+    pub description: String,
+    pub parameters: Vec<AIGeneratedCommandParameter>,
 }
 
 pub struct AIGeneratedCommandParameter {
-    id: String,
-    description: String,
+    pub id: String,
+    pub description: String,
 }
 
 impl From<AIGeneratedCommand> for Workflow {

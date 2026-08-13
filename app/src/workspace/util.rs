@@ -78,7 +78,7 @@ impl WelcomeTipsViewState {
 }
 
 // TODO change this struct to enum (as we can only have 1 of them set to true at a time)
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct WorkspaceState {
     pub is_palette_open: bool,
     pub is_ctrl_tab_palette_open: bool,
@@ -124,6 +124,55 @@ pub struct WorkspaceState {
     pane_being_renamed: Option<PaneViewLocator>,
     /// The tab group whose header is currently being renamed inline.
     tab_group_being_renamed: Option<TabGroupId>,
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self {
+            is_palette_open: false,
+            is_ctrl_tab_palette_open: false,
+            is_theme_chooser_open: false,
+            is_theme_creator_modal_open: false,
+            is_theme_deletion_modal_open: false,
+            is_changelog_modal_open: false,
+            is_tab_being_dragged: false,
+            is_reward_modal_open: false,
+            is_launch_config_save_modal_open: false,
+            is_resource_center_open: false,
+            is_command_search_open: false,
+            is_warp_drive_open: false,
+            is_ai_assistant_panel_open: true,
+            is_agent_management_popup_open: false,
+            is_auth_override_modal_open: false,
+            is_require_login_modal_open: false,
+            is_workflow_modal_open: false,
+            is_prompt_editor_open: false,
+            is_agent_toolbar_editor_open: false,
+            is_header_toolbar_editor_open: false,
+            is_import_modal_open: false,
+            is_close_session_confirmation_dialog_open: false,
+            is_rewind_confirmation_dialog_open: false,
+            is_delete_conversation_confirmation_dialog_open: false,
+            is_native_quit_modal_open: false,
+            is_shared_objects_creation_denied_modal_open: false,
+            is_suggested_agent_mode_workflow_modal_open: false,
+            is_suggested_rule_modal_open: false,
+            is_enable_auto_reload_modal_open: false,
+            is_notification_mailbox_open: false,
+            is_agent_management_view_open: false,
+            is_codex_modal_open: false,
+            is_cloud_agent_capacity_modal_open: false,
+            is_prompt_suggestions_unavailable_modal_open: false,
+            is_tab_config_params_modal_open: false,
+            is_session_config_modal_open: false,
+            is_new_worktree_modal_open: false,
+            is_remove_tab_config_dialog_open: false,
+            is_transcript_details_panel_open: false,
+            tab_being_renamed: None,
+            pane_being_renamed: None,
+            tab_group_being_renamed: None,
+        }
+    }
 }
 
 impl WorkspaceState {

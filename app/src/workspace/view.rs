@@ -4809,19 +4809,14 @@ impl Workspace {
         }
 
         // Otherwise, open / close the panel accordingly.
-        self.current_workspace_state.is_ai_assistant_panel_open =
-            !self.current_workspace_state.is_ai_assistant_panel_open;
+        self.current_workspace_state.is_ai_assistant_panel_open = true;
 
         // Close any other modals that could be floating on top of the Warp AI panel.
         self.current_workspace_state.close_all_modals();
 
-        if self.current_workspace_state.is_ai_assistant_panel_open {
-            // Close the resource center panel if we open the AI Assistant panel.
-            self.current_workspace_state.is_resource_center_open = false;
-            ctx.focus(&self.ai_assistant_panel);
-        } else {
-            self.focus_active_tab(ctx);
-        }
+        // Close the resource center panel if we open the AI Assistant panel.
+        self.current_workspace_state.is_resource_center_open = false;
+        ctx.focus(&self.ai_assistant_panel);
         ctx.notify();
     }
 
@@ -9341,8 +9336,8 @@ impl Workspace {
     pub fn toggle_resource_center(&mut self, ctx: &mut ViewContext<Self>) {
         // Close AI Assistant panel when resource center is opened
         if !self.current_workspace_state.is_resource_center_open {
-            self.current_workspace_state.is_ai_assistant_panel_open = false;
-            self.focus_active_tab(ctx);
+            self.current_workspace_state.is_ai_assistant_panel_open = true;
+            ctx.focus(&self.ai_assistant_panel);
         }
 
         if !self.current_workspace_state.is_resource_center_open {
@@ -9956,7 +9951,7 @@ impl Workspace {
                 });
 
             // Ensure other right panels are closed
-            self.current_workspace_state.is_ai_assistant_panel_open = false;
+            self.current_workspace_state.is_ai_assistant_panel_open = true;
             // Open side panel
             self.current_workspace_state.is_resource_center_open = true;
             send_telemetry_from_ctx!(TelemetryEvent::KeybindingsPageOpened, ctx);
@@ -9972,7 +9967,7 @@ impl Workspace {
         } else {
             // Close side panel
             self.current_workspace_state.is_resource_center_open = false;
-            self.focus_active_tab(ctx);
+            ctx.focus(&self.ai_assistant_panel);
         }
 
         ctx.notify();
@@ -18665,12 +18660,10 @@ impl Workspace {
 
         self.current_workspace_state.close_all_left_panels();
 
-        // When showing the theme chooser, let's close the command palette
-        // in case it was used to open the theme chooser.
         self.current_workspace_state.is_palette_open = false;
         self.current_workspace_state.is_ctrl_tab_palette_open = false;
         self.previous_workspace_state = Some(self.current_workspace_state);
-        self.current_workspace_state.is_ai_assistant_panel_open = false;
+        self.current_workspace_state.is_ai_assistant_panel_open = true;
         self.current_workspace_state.is_theme_chooser_open = true;
 
         self.previous_theme = Some(current_theme);
@@ -18945,8 +18938,7 @@ impl Workspace {
     ) {
         match event {
             AIAssistantPanelEvent::ClosePanel => {
-                self.current_workspace_state.is_ai_assistant_panel_open = false;
-                self.focus_active_tab(ctx);
+                // Do not close AI Assistant panel as we are isolating Warp AI.
                 ctx.notify();
             }
             AIAssistantPanelEvent::PasteInTerminalInput(code) => {
@@ -26587,33 +26579,9 @@ impl View for Workspace {
             }
         }
 
-        let panels = if use_simplified_wasm_tab_bar {
-            // For the simplified WASM tab bar, we want to render the tab bar on top of all other content
-            // so that content being added/moved around in the workspace (for example the details panel being toggled)
-            // does not affect the tab.
-            let mut outer_column = Flex::column();
-            if tab_bar_mode == ShowTabBar::Stacked {
-                outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
-            }
-            let content = self.render_banner_and_active_tab(app, appearance);
-            // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
-            let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
-            outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
-            Container::new(outer_column.finish())
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
-                .finish()
-        } else {
-            let mut outer_column = Flex::column();
-            if tab_bar_mode == ShowTabBar::Stacked {
-                outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
-            }
-            let content = self.render_banner_and_active_tab(app, appearance);
-            let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
-            outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
-            Container::new(outer_column.finish())
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
-                .finish()
-        };
+        let panels = Container::new(ChildView::new(&self.ai_assistant_panel).finish())
+            .with_background(util::get_terminal_background_fill(self.window_id, app))
+            .finish();
         let mut stack = Stack::new();
 
         #[cfg(target_family = "wasm")]

@@ -2185,9 +2185,16 @@ impl AISettings {
             .get()
             .is_anonymous_or_logged_out();
 
-        *self.is_any_ai_enabled
+        let mut allowed = *self.is_any_ai_enabled
             && !is_anonymous_or_logged_out
-            && !self.is_ai_disabled_due_to_remote_session_org_policy(app)
+            && !self.is_ai_disabled_due_to_remote_session_org_policy(app);
+
+        #[cfg(feature = "skip_login")]
+        {
+            allowed = *self.is_any_ai_enabled && !self.is_ai_disabled_due_to_remote_session_org_policy(app);
+        }
+
+        allowed
     }
 
     /// Returns whether conversation history is available for the current
@@ -2255,9 +2262,16 @@ impl AISettings {
     }
 
     pub fn is_active_ai_enabled(&self, app: &warpui::AppContext) -> bool {
-        self.is_any_ai_enabled(app)
-            && *self.is_active_ai_enabled_internal
-            && AppExecutionMode::as_ref(app).allows_active_ai()
+        #[cfg(feature = "skip_login")]
+        {
+            return self.is_any_ai_enabled(app);
+        }
+        #[cfg(not(feature = "skip_login"))]
+        {
+            self.is_any_ai_enabled(app)
+                && *self.is_active_ai_enabled_internal
+                && AppExecutionMode::as_ref(app).allows_active_ai()
+        }
     }
 
     pub fn is_prompt_suggestions_enabled(&self, app: &warpui::AppContext) -> bool {
@@ -2306,7 +2320,14 @@ impl AISettings {
     /// If `FeatureFlag::AgentView` is enabled, this specifically gates NLD enablement in the agent
     /// view only.
     pub fn is_ai_autodetection_enabled(&self, app: &warpui::AppContext) -> bool {
-        self.is_any_ai_enabled(app) && *self.ai_autodetection_enabled_internal
+        #[cfg(feature = "skip_login")]
+        {
+            return self.is_any_ai_enabled(app);
+        }
+        #[cfg(not(feature = "skip_login"))]
+        {
+            self.is_any_ai_enabled(app) && *self.ai_autodetection_enabled_internal
+        }
     }
 
     /// Returns `true` if NLD is enabled in the terminal.
@@ -2315,7 +2336,14 @@ impl AISettings {
     /// If the user has not explicitly set this setting, it defaults to the value of
     /// `ai_autodetection_enabled_internal`.
     pub fn is_nld_in_terminal_enabled(&self, app: &warpui::AppContext) -> bool {
-        self.is_any_ai_enabled(app) && *self.nld_in_terminal_enabled_internal
+        #[cfg(feature = "skip_login")]
+        {
+            return self.is_any_ai_enabled(app);
+        }
+        #[cfg(not(feature = "skip_login"))]
+        {
+            self.is_any_ai_enabled(app) && *self.nld_in_terminal_enabled_internal
+        }
     }
 
     pub fn is_memory_enabled(&self, app: &warpui::AppContext) -> bool {

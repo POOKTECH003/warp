@@ -734,6 +734,8 @@ pub struct LLMPreferences {
     /// Rebuilt from scratch on every `ApiKeyManagerEvent::KeysUpdated`, so adds, edits, and
     /// removals all immediately propagate to the picker.
     custom_llms: Vec<LLMInfo>,
+    /// Local Ollama models synced on startup or periodically.
+    ollama_llms: Vec<LLMInfo>,
     /// All custom model routers, including both local and cloud-backed.
     custom_model_routers: Vec<CustomModelRouter>,
 }
@@ -794,15 +796,27 @@ impl LLMPreferences {
 
         let base_llm_for_terminal_view = HashMap::new();
         let custom_llms = build_custom_llm_infos(ApiKeyManager::as_ref(ctx).keys());
-
         let mut me = Self {
             models_by_feature,
             agent_mode_models_unavailable: false,
             last_update: None,
             base_llm_for_terminal_view,
             custom_llms,
+            ollama_llms: Vec::new(),
             custom_model_routers: Vec::new(),
         };
+
+        // Kick off an async fetch for local Ollama models.
+        ctx.spawn(
+            async move { crate::ai::ollama_sync::fetch_ollama_models().await },
+            |me, models, ctx| {
+                if !models.is_empty() {
+                    me.ollama_llms = models;
+                    ctx.emit(LLMPreferencesEvent::OllamaModelsFetched);
+                    ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
+                }
+            },
+        );
 
         // Seed from any already-loaded local config (the async load emits
         // `ModelConfigs` shortly after startup to populate fully).
@@ -877,6 +891,7 @@ impl LLMPreferences {
         available
             .usable_default_llm_info(app)
             .or_else(|| self.custom_llm_choices(app).next())
+            .or_else(|| self.ollama_llm_choices(app).next())
             .unwrap_or_else(|| available.default_llm_info())
     }
 
@@ -895,6 +910,7 @@ impl LLMPreferences {
     ) -> Option<&'a LLMInfo> {
         Self::server_info_for_id_router_gated(available, id)
             .or_else(|| self.custom_llm_info_for_id_if_enabled(id, app))
+            .or_else(|| self.ollama_llm_info_for_id_if_enabled(id, app))
             .or_else(|| self.custom_router_llm_info_for_id_if_enabled(id))
     }
 
@@ -958,6 +974,7 @@ impl LLMPreferences {
                 routers_enabled || !custom_model_routers::is_cloud_custom_router_id(llm.id.as_str())
             })
             .chain(self.custom_llm_choices(app))
+            .chain(self.ollama_llm_choices(app))
             .chain(self.custom_router_choices())
     }
 
@@ -983,6 +1000,7 @@ impl LLMPreferences {
                 routers_enabled || !custom_model_routers::is_cloud_custom_router_id(llm.id.as_str())
             })
             .chain(self.custom_llm_choices(app))
+            .chain(self.ollama_llm_choices(app))
             .chain(self.custom_router_choices())
     }
 
@@ -997,6 +1015,7 @@ impl LLMPreferences {
             .iter()
             .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
             .chain(self.custom_llm_choices(app))
+            .chain(self.ollama_llm_choices(app))
     }
 
     /// Returns the `LLMInfo` for the CLI agent model.
@@ -1016,6 +1035,7 @@ impl LLMPreferences {
                 available
                     .info_for_id(&id)
                     .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
+                    .or_else(|| self.ollama_llm_info_for_id_if_enabled(&id, app))
             })
             .unwrap_or_else(|| self.fallback_llm_info(available, app))
     }
@@ -1084,6 +1104,7 @@ impl LLMPreferences {
         self.models_by_feature
             .info_for_id(id)
             .or_else(|| self.custom_llm_info_for_id(id))
+            .or_else(|| self.ollama_llm_info_for_id(id))
             .or_else(|| self.custom_router_llm_info_for_id(id))
     }
 
@@ -1091,6 +1112,12 @@ impl LLMPreferences {
     /// Returns `None` if the id isn't a known custom model `config_key`.
     pub fn custom_llm_info_for_id(&self, id: &LLMId) -> Option<&LLMInfo> {
         self.custom_llms.iter().find(|info| info.id == *id)
+    }
+
+    /// Resolves an `LLMId` against the user's Ollama LLMs.
+    /// Returns `None` if the id isn't a known Ollama model.
+    pub fn ollama_llm_info_for_id(&self, id: &LLMId) -> Option<&LLMInfo> {
+        self.ollama_llms.iter().find(|info| info.id == *id)
     }
 
     /// Returns `true` when `id` identifies a model that can run in a Warp cloud
@@ -1110,6 +1137,7 @@ impl LLMPreferences {
     /// they are treated as runnable here.
     pub fn is_cloud_runnable_oz_model_id(&self, id: &LLMId) -> bool {
         !(self.custom_llm_info_for_id(id).is_some()
+            || self.ollama_llm_info_for_id(id).is_some()
             || custom_model_routers::is_local_custom_router_id(id.as_str()))
     }
 
@@ -1151,6 +1179,12 @@ impl LLMPreferences {
             .flatten()
     }
 
+    fn ollama_llm_info_for_id_if_enabled(&self, id: &LLMId, app: &AppContext) -> Option<&LLMInfo> {
+        Self::custom_inference_enabled(app)
+            .then(|| self.ollama_llm_info_for_id(id))
+            .flatten()
+    }
+
     /// Iterator over the user's custom-endpoint LLMs, gated on the feature flag and entitlement.
     pub fn custom_llm_choices(&self, app: &AppContext) -> std::slice::Iter<'_, LLMInfo> {
         if Self::custom_inference_enabled(app) {
@@ -1158,6 +1192,14 @@ impl LLMPreferences {
         } else {
             // Empty slice with a matching element type so the return type stays consistent
             // across both branches.
+            (&[] as &[LLMInfo]).iter()
+        }
+    }
+
+    pub fn ollama_llm_choices(&self, app: &AppContext) -> std::slice::Iter<'_, LLMInfo> {
+        if Self::custom_inference_enabled(app) {
+            self.ollama_llms.iter()
+        } else {
             (&[] as &[LLMInfo]).iter()
         }
     }
@@ -1923,6 +1965,7 @@ pub enum LLMPreferencesEvent {
     UpdatedAvailableLLMs,
     UpdatedActiveAgentModeLLM,
     UpdatedActiveCodingLLM,
+    OllamaModelsFetched,
 }
 
 impl Entity for LLMPreferences {

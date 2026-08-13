@@ -26,14 +26,13 @@ use super::requests::{RequestStatus, Requests};
 use super::utils::{
     AssistantTranscriptPart, CodeBlockIndex, FormattedTranscriptMessage, MarkdownSegment,
     TranscriptPartSubType, code_block_position_id, markdown_segments_from_text,
-    render_prepared_response_button, render_request_limit_info, save_as_workflow_position_id,
+    render_prepared_response_button, save_as_workflow_position_id,
 };
 use crate::ai::AIRequestUsageModel;
 use crate::appearance::Appearance;
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::{SaveAsWorkflowModalSource, TelemetryEvent, WarpAIActionType};
 use crate::ui_components::blended_colors;
-use crate::workspaces::user_workspaces::UserWorkspaces;
 
 const TRANSCRIPT_POSITION_ID: &str = "ai_assistant::transcript";
 
@@ -46,19 +45,14 @@ const CODE_FONT_SIZE: f32 = 12.;
 const WARNING_MESSAGE_FONT_SIZE: f32 = 10.;
 
 const PANEL_LEFT_MARGIN: f32 = 15.;
-const DETAILS_BOTTOM_MARGIN: f32 = 12.;
 
 const COPY_BUTTON_SIZE: f32 = 14.;
 const TERMINAL_INPUT_BUTTON_SIZE: f32 = 20.;
 const SAVE_AS_WORKFLOW_BUTTON_SIZE: f32 = 20.;
-
-const HOW_DO_I_FIX_PROMPT: &str = "How do I fix this?";
-const SHOW_EXAMPLES_PROMPT: &str = "Show examples.";
-const WHAT_TO_DO_NEXT_PROMPT: &str = "What should I do next?";
-const IN_FLIGHT_REQUEST_TEXT: &str = "Generating answer...";
-const ACCURACY_NOTICE_TEXT: &str = "AI responses can be inaccurate.";
-const MISSING_CONTEXT_NOTICE_TEXT: &str =
-    "Warp AI might forget earlier answers as conversations get long.";
+const HOW_DO_I_FIX_PROMPT: &str = "我该如何修复它？";
+const SHOW_EXAMPLES_PROMPT: &str = "显示示例。";
+const WHAT_TO_DO_NEXT_PROMPT: &str = "下一步我该怎么做？";
+const IN_FLIGHT_REQUEST_TEXT: &str = "正在生成回答...";
 
 lazy_static::lazy_static! {
     static ref SCROLL_BUFFER_OFFSET_PX: Pixels = (10.).into_pixels();
@@ -826,26 +820,57 @@ impl View for Transcript {
         }
 
         if let RequestStatus::InFlight { request, .. } = request_status {
-            blocks.add_child(self.render_user_prompt(request, appearance));
+            #[cfg(not(feature = "skip_login"))]
+            {
+                blocks.add_child(self.render_user_prompt(request, appearance));
 
-            let transcript_part_index = transcript.len();
-            let in_flight_request_markdown = markdown_segments_from_text(
-                transcript_part_index,
-                TranscriptPartSubType::Answer,
-                IN_FLIGHT_REQUEST_TEXT,
-            );
-            blocks.add_child(self.render_assistant_answer(
-                transcript_part_index,
-                &AssistantTranscriptPart {
-                    is_error: false,
-                    copy_all_tooltip_and_button_mouse_handles: None,
-                    formatted_message: FormattedTranscriptMessage {
-                        markdown: in_flight_request_markdown,
-                        raw: IN_FLIGHT_REQUEST_TEXT.to_owned(),
+                let transcript_part_index = transcript.len();
+                let in_flight_request_markdown = markdown_segments_from_text(
+                    transcript_part_index,
+                    TranscriptPartSubType::Answer,
+                    IN_FLIGHT_REQUEST_TEXT,
+                );
+                blocks.add_child(self.render_assistant_answer(
+                    transcript_part_index,
+                    &AssistantTranscriptPart {
+                        is_error: false,
+                        copy_all_tooltip_and_button_mouse_handles: None,
+                        formatted_message: FormattedTranscriptMessage {
+                            markdown: in_flight_request_markdown,
+                            raw: IN_FLIGHT_REQUEST_TEXT.to_owned(),
+                        },
                     },
-                },
-                appearance,
-            ));
+                    appearance,
+                ));
+            }
+            #[cfg(feature = "skip_login")]
+            {
+                let _ = request;
+                // In skip_login, the user prompt is already in the transcript immediately.
+                // We only render a placeholder if the assistant's response is still empty.
+                if let Some(last) = transcript.last() {
+                    if last.assistant.formatted_message.raw.is_empty() {
+                        let transcript_part_index = transcript.len() - 1;
+                        let in_flight_request_markdown = markdown_segments_from_text(
+                            transcript_part_index,
+                            TranscriptPartSubType::Answer,
+                            IN_FLIGHT_REQUEST_TEXT,
+                        );
+                        blocks.add_child(self.render_assistant_answer(
+                            transcript_part_index,
+                            &AssistantTranscriptPart {
+                                is_error: false,
+                                copy_all_tooltip_and_button_mouse_handles: None,
+                                formatted_message: FormattedTranscriptMessage {
+                                    markdown: in_flight_request_markdown,
+                                    raw: IN_FLIGHT_REQUEST_TEXT.to_owned(),
+                                },
+                            },
+                            appearance,
+                        ));
+                    }
+                }
+            }
         }
 
         if !transcript.is_empty() && matches!(request_status, RequestStatus::NotInFlight) {
@@ -859,51 +884,7 @@ impl View for Transcript {
                 );
             }
 
-            let user_workspaces = UserWorkspaces::as_ref(app);
-            let is_custom_llm_enabled = user_workspaces.is_custom_llm_enabled_for_team(
-                user_workspaces.team_for_view_handle(&self.view_handle, app),
-            );
-
-            if !is_custom_llm_enabled {
-                blocks.add_child(
-                    Container::new(render_request_limit_info(
-                        &self.requests_model,
-                        app,
-                        appearance,
-                    ))
-                    .with_margin_top(15.)
-                    .finish(),
-                );
-            }
-
-            let current_transcript_summarized = self
-                .requests_model
-                .as_ref(app)
-                .current_transcript_summarized();
-
-            blocks.add_child(
-                Container::new(
-                    self.render_warning_message(ACCURACY_NOTICE_TEXT.to_string(), appearance),
-                )
-                .with_margin_top(DETAILS_BOTTOM_MARGIN)
-                .with_margin_bottom(if current_transcript_summarized {
-                    DETAILS_BOTTOM_MARGIN / 2.
-                } else {
-                    DETAILS_BOTTOM_MARGIN
-                })
-                .finish(),
-            );
-
-            if current_transcript_summarized {
-                blocks.add_child(
-                    Container::new(self.render_warning_message(
-                        MISSING_CONTEXT_NOTICE_TEXT.to_string(),
-                        appearance,
-                    ))
-                    .with_margin_bottom(DETAILS_BOTTOM_MARGIN)
-                    .finish(),
-                );
-            }
+            // Request limit info and accuracy notices are disabled in local isolation mode.
         }
 
         // Note: we don't render a scrollbar because the gutter makes the segmented transcript

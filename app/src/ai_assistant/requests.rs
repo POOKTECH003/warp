@@ -24,6 +24,15 @@ use crate::workspaces::user_workspaces::UserWorkspaces;
 /// Not wiring through Settings for now since this data is only needed by the panel view.
 pub const REQUEST_LIMIT_INFO_CACHE_KEY: &str = "AIAssistantRequestLimitInfo";
 
+enum StreamProgress {
+    Chunk(String),
+    Success {
+        answer: String,
+        truncated: bool,
+    },
+    Failure,
+}
+
 /// Tracks the current request status for making Warp AI requests against server.
 pub enum RequestStatus {
     /// There isn't a request in flight right now.
@@ -185,6 +194,151 @@ impl Requests {
             TranscriptPartSubType::Question,
             raw_request,
         );
+
+        #[cfg(feature = "skip_login")]
+        {
+            let _ = team_uid;
+            let _ = server_api;
+            let _ = request_for_api;
+            let _ = ai_execution_context;
+
+            let (tx, rx) = async_channel::unbounded::<StreamProgress>();
+
+            // Push initial empty answer to transcript
+            self.current_transcript.push(TranscriptPart {
+                user: FormattedTranscriptMessage {
+                    markdown: request_in_markdown.clone(),
+                    raw: raw_request.to_string(),
+                },
+                assistant: AssistantTranscriptPart {
+                    is_error: false,
+                    copy_all_tooltip_and_button_mouse_handles: Some((Default::default(), Default::default())),
+                    formatted_message: FormattedTranscriptMessage {
+                        markdown: None,
+                        raw: String::new(),
+                    },
+                },
+            });
+
+            // Spawn the stream receiver on the main thread
+            ctx.spawn_stream_local(
+                rx,
+                move |model, progress, ctx| {
+                    match progress {
+                        StreamProgress::Chunk(text) => {
+                            let idx = model.current_transcript.len().saturating_sub(1);
+                            if let Some(last) = model.current_transcript.last_mut() {
+                                last.assistant.formatted_message.raw.push_str(&text);
+                                last.assistant.formatted_message.markdown = markdown_segments_from_text(
+                                    idx,
+                                    TranscriptPartSubType::Answer,
+                                    &last.assistant.formatted_message.raw,
+                                );
+                                ctx.notify();
+                            }
+                        }
+                        StreamProgress::Success { answer, truncated } => {
+                            let idx = model.current_transcript.len().saturating_sub(1);
+                            if let Some(last) = model.current_transcript.last_mut() {
+                                let mut final_answer = answer;
+                                if truncated {
+                                    final_answer.push_str("...");
+                                }
+                                let trimmed = final_answer.trim().to_string();
+                                last.assistant.formatted_message.raw = trimmed.clone();
+                                last.assistant.formatted_message.markdown = markdown_segments_from_text(
+                                    idx,
+                                    TranscriptPartSubType::Answer,
+                                    &trimmed,
+                                );
+                            }
+                            model.request_status = RequestStatus::NotInFlight;
+                            ctx.emit(Event::RequestFinished { succeeded: true });
+                            ctx.notify();
+                        }
+                        StreamProgress::Failure => {
+                            let idx = model.current_transcript.len().saturating_sub(1);
+                            if let Some(last) = model.current_transcript.last_mut() {
+                                last.assistant.is_error = true;
+                                last.assistant.formatted_message.raw = "无法连接到本地 Ollama 服务或生成失败。".to_string();
+                                last.assistant.formatted_message.markdown = markdown_segments_from_text(
+                                    idx,
+                                    TranscriptPartSubType::Answer,
+                                    &last.assistant.formatted_message.raw,
+                                );
+                            }
+                            model.request_status = RequestStatus::NotInFlight;
+                            ctx.emit(Event::RequestFinished { succeeded: false });
+                            ctx.notify();
+                        }
+                    }
+                },
+                |_, _| {},
+            );
+
+            // Spawn the background future to fetch the stream from Ollama
+            let model_transcript = transcript;
+            let request_for_api = raw_request.to_string();
+
+            let future_handle = ctx.spawn(
+                async move {
+                    let mut messages = vec![];
+                    for part in &model_transcript {
+                        messages.push(serde_json::json!({"role": "user", "content": part.raw_user_prompt()}));
+                        messages.push(serde_json::json!({"role": "assistant", "content": part.raw_assistant_answer()}));
+                    }
+                    messages.push(serde_json::json!({"role": "user", "content": request_for_api}));
+
+                    let client = reqwest::Client::new();
+                    if let Ok(response) = client
+                        .post("http://localhost:11434/api/chat")
+                        .json(&serde_json::json!({
+                            "model": "qwen2:7b",
+                            "messages": messages,
+                            "stream": true
+                        }))
+                        .send()
+                        .await
+                    {
+                        let mut buffer = String::new();
+                        let mut full_answer = String::new();
+                        let mut response = response;
+                        while let Ok(Some(chunk)) = response.chunk().await {
+                            if let Ok(text) = std::str::from_utf8(&chunk) {
+                                buffer.push_str(text);
+                                while let Some(newline_idx) = buffer.find('\n') {
+                                    let line = buffer[..newline_idx].trim().to_string();
+                                    buffer = buffer[newline_idx + 1..].to_string();
+                                    if !line.is_empty() {
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                            if let Some(content) = json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                                                full_answer.push_str(content);
+                                                let _ = tx.send(StreamProgress::Chunk(content.to_string())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let _ = tx.send(StreamProgress::Success { answer: full_answer, truncated: false }).await;
+                    } else {
+                        let _ = tx.send(StreamProgress::Failure).await;
+                    }
+                },
+                |_, _, _| {}
+            );
+
+            self.request_status = RequestStatus::InFlight {
+                request: FormattedTranscriptMessage {
+                    markdown: request_in_markdown,
+                    raw: raw_request.to_string(),
+                },
+                abort_handle: future_handle.abort_handle(),
+            };
+
+            ctx.notify();
+            return;
+        }
 
         let future_handle = ctx.spawn(
             async move {

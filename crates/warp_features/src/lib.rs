@@ -1065,6 +1065,9 @@ pub const RUNTIME_FEATURE_FLAGS: &[FeatureFlag] = &[FeatureFlag::LocalClaudeCode
 
 impl FeatureFlag {
     pub fn is_enabled(&self) -> bool {
+        if matches!(self, FeatureFlag::AgentMode | FeatureFlag::AgentView) {
+            return false;
+        }
         #[cfg(all(debug_assertions, not(feature = "test-util")))]
         {
             use std::sync::atomic::Ordering;

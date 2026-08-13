@@ -49,7 +49,6 @@ handlebars = { path = "crates/handlebars" }
 http_client = { path = "crates/http_client" }
 http_server = { path = "crates/http_server" }
 input_classifier = { path = "crates/input_classifier" }
-integration = { path = "crates/integration" }
 ipc = { path = "crates/ipc" }
 ipynb_parser = { path = "crates/ipynb_parser" }
 jsonrpc = { path = "crates/jsonrpc" }
@@ -473,6 +472,9 @@ fdeflate.opt-level = 3
 image.opt-level = 3
 png.opt-level = 3
 miniz_oxide.opt-level = 3
+warpui.opt-level = 3
+warpui_core.opt-level = 3
+"*" = { opt-level = 3 }
 
 # A profile that behaves like release but enables ThinLTO, which should produce
 # binaries with better runtime performance with little build-time overhead.

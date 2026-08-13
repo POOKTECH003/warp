@@ -510,7 +510,6 @@ creating_shared_sessions = []
 cross_repo_context = []
 codebase_index_persistence = ["full_source_code_embedding"]
 default = [
-    "agent_mode",
     "osc_hyperlinks",
     "viewing_shared_sessions",
     "render_continuous_block_selections_with_single_border",
@@ -548,6 +547,7 @@ default = [
     "image_as_context",
     "command_palette_file_search",
     "usage_based_pricing",
+    "skip_login",
     "ai_context_menu",
     "at_menu_outside_of_ai_mode",
     "agent_management_view",

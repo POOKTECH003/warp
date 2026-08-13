@@ -805,6 +805,7 @@ impl ExecutionProfileEditorView {
                         ctx,
                     );
                 }
+                LLMPreferencesEvent::OllamaModelsFetched => {}
             }
         });
 

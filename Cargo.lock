@@ -6430,12 +6430,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "http-range-header"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ce4ef31cda248bbdb6e6820603b82dfcd9e833db65a43e997a0ccec777d11fe"
-
-[[package]]
 name = "http_client"
 version = "0.0.0"
 dependencies = [
@@ -6976,52 +6970,6 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
  "web-sys",
-]
-
-[[package]]
-name = "integration"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "app-installation-detection",
- "backtrace",
- "cfg-if",
- "chrono",
- "clap",
- "command",
- "diesel",
- "directories",
- "float-cmp",
- "instant",
- "itertools 0.14.0",
- "lazy_static",
- "log",
- "mockito",
- "nix 0.26.4",
- "parking_lot",
- "pathfinder_geometry",
- "rand 0.8.6",
- "regex",
- "rust-embed 8.7.2",
- "serde",
- "serde_json",
- "settings",
- "simplelog",
- "strum 0.27.1",
- "strum_macros 0.27.1",
- "sum_tree",
- "sysinfo",
- "version-compare",
- "warp",
- "warp-command-signatures",
- "warp-workflows",
- "warp_cli",
- "warp_core",
- "warp_multi_agent_api",
- "warpui",
- "warpui_core",
- "warpui_extras",
- "whoami",
 ]
 
 [[package]]
@@ -8062,17 +8010,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "managed_secrets_wasm"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "warp_managed_secrets",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -12585,20 +12522,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serve-wasm"
-version = "0.1.0"
-dependencies = [
- "axum",
- "axum-extra",
- "clap",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "session-sharing-protocol"
 version = "0.0.0"
 source = "git+https://github.com/warpdotdev/session-sharing-protocol.git?rev=b30fdd06379a3d073b398eabd106abed5b443aae#b30fdd06379a3d073b398eabd106abed5b443aae"
@@ -14304,12 +14227,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "http-range-header",
- "httpdate",
  "iri-string",
- "mime",
- "mime_guess",
- "percent-encoding",
  "pin-project-lite",
  "tokio",
  "tokio-util",
@@ -15998,67 +15916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "warp_tui"
-version = "0.0.0"
-dependencies = [
- "ai",
- "anyhow",
- "arboard",
- "async-channel",
- "async-fs",
- "base64 0.22.1",
- "blocking",
- "channel_versions",
- "chrono",
- "clap",
- "command",
- "criterion",
- "dirs 6.0.0",
- "dunce",
- "fs4",
- "futures",
- "futures-lite 1.13.0",
- "http_client",
- "inquire",
- "instant",
- "itertools 0.14.0",
- "log",
- "markdown_parser",
- "num-traits",
- "parking_lot",
- "pathfinder_color",
- "pathfinder_geometry",
- "rangemap",
- "serde_json",
- "shell-words",
- "similar",
- "string-offset",
- "strum 0.27.1",
- "strum_macros 0.27.1",
- "sum_tree",
- "tempfile",
- "tokio",
- "unicode-segmentation",
- "unicode-width 0.1.14",
- "uuid",
- "vec1",
- "vim",
- "warp",
- "warp_channel_config",
- "warp_completer",
- "warp_core",
- "warp_editor",
- "warp_errors",
- "warp_files",
- "warp_logging",
- "warp_search_core",
- "warp_terminal",
- "warp_util",
- "warpui",
- "warpui_core",
-]
-
-[[package]]
 name = "warp_util"
 version = "0.1.0"
 dependencies = [
@@ -16336,12 +16193,6 @@ checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
 dependencies = [
  "wit-bindgen",
 ]
-
-[[package]]
-name = "wasite"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8dad83b4f25e74f184f64c43b150b91efe7647395b42289f38e50566d82855b"
 
 [[package]]
 name = "wasm-bindgen"
@@ -16945,17 +16796,6 @@ dependencies = [
  "home",
  "once_cell",
  "rustix 0.38.44",
-]
-
-[[package]]
-name = "whoami"
-version = "1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "372d5b87f58ec45c384ba03563b03544dc5fadc3983e434b286913f5b4a9bb6d"
-dependencies = [
- "redox_syscall 0.5.7",
- "wasite",
- "web-sys",
 ]
 
 [[package]]

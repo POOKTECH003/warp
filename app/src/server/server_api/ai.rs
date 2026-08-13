@@ -1645,6 +1645,30 @@ impl AIClient for ServerApi {
     ) -> Result<Vec<AIGeneratedCommand>, GenerateCommandsFromNaturalLanguageError> {
         let default_err = GenerateCommandsFromNaturalLanguageError::Other;
 
+        #[cfg(feature = "skip_login")]
+        {
+            if let Ok(response) = reqwest::Client::new()
+                .post("http://localhost:11434/api/generate")
+                .json(&serde_json::json!({
+                    "model": "qwen2:7b",
+                    "prompt": format!("You are a terminal assistant. Generate a shell command for this request: {}. Reply with ONLY the shell command, no explanation, no markdown backticks.", prompt),
+                    "stream": false
+                }))
+                .send()
+                .await
+            {
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    if let Some(text) = json.get("response").and_then(|r| r.as_str()) {
+                        return Ok(vec![AIGeneratedCommand {
+                            command: text.trim().to_string(),
+                            description: prompt.clone(),
+                            parameters: vec![],
+                        }]);
+                    }
+                }
+            }
+        }
+
         let variables = GenerateCommandsVariables {
             input: GenerateCommandsInput { prompt },
             request_context: get_request_context(),
@@ -1682,6 +1706,38 @@ impl AIClient for ServerApi {
         // TODO: use relevant context from RequestContext and deprecate usage of ai_execution_context
         _ai_execution_context: Option<WarpAiExecutionContext>,
     ) -> anyhow::Result<GenerateDialogueResult> {
+        #[cfg(feature = "skip_login")]
+        {
+            let mut messages = vec![];
+            for part in &transcript {
+                messages.push(serde_json::json!({"role": "user", "content": part.raw_user_prompt()}));
+                messages.push(serde_json::json!({"role": "assistant", "content": part.raw_assistant_answer()}));
+            }
+            messages.push(serde_json::json!({"role": "user", "content": prompt}));
+
+            if let Ok(response) = reqwest::Client::new()
+                .post("http://localhost:11434/api/chat")
+                .json(&serde_json::json!({
+                    "model": "qwen2:7b",
+                    "messages": messages,
+                    "stream": false
+                }))
+                .send()
+                .await
+            {
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    if let Some(content) = json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                        return Ok(GenerateDialogueResult::Success {
+                            answer: content.to_string(),
+                            truncated: false,
+                            request_limit_info: crate::ai::request_usage_model::RequestLimitInfo::default(),
+                            transcript_summarized: false,
+                        });
+                    }
+                }
+            }
+        }
+
         let graphql_transcript: Vec<TranscriptPartGraphql> = transcript
             .into_iter()
             .map(|part| TranscriptPartGraphql {

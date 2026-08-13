@@ -9,9 +9,9 @@ use warpui::r#async::Timer;
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
     Align, Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-    DispatchEventResult, DragBarSide, Element, Empty, EventHandler, Fill, Flex, HyperlinkUrl, Icon,
+    DispatchEventResult, Element, Empty, EventHandler, Fill, Flex, HyperlinkUrl, Icon,
     MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
-    ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Resizable,
+    ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds, Radius,
     ResizableStateHandle, SavePosition, Shrinkable, Stack, Text, resizable_state_handle,
 };
 use warpui::fonts::Properties;
@@ -22,7 +22,7 @@ use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
     AppContext, Entity, FocusContext, ModelHandle, SingletonEntity, TypedActionView, View,
-    ViewContext, ViewHandle, WeakViewHandle,
+    ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
 use super::execution_context::WarpAiExecutionContext;
@@ -70,15 +70,15 @@ const BODY_FONT_SIZE: f32 = 13.;
 const TITLE_FONT_SIZE: f32 = 16.;
 const ZERO_STATE_HELP_TEXT_FONT_SIZE: f32 = 12.;
 
-const ZERO_STATE_HELP_TEXT: &str = "Shift + ctrl + space a block or text selection to ask Warp AI.";
-const SCRIPT_ZERO_STATE_PROMPT: &str = "Write a script to connect to an AWS EC2 instance.";
-const GIT_ZERO_STATE_PROMPT: &str = "How do I undo the most recent commits in git?";
-const FILES_ZERO_STATE_PROMPT: &str = "How do I find all files containing specific text?";
+const ZERO_STATE_HELP_TEXT: &str = "按下 Shift + Ctrl + Space 选择代码块或文本向 Warp AI 提问。";
+const SCRIPT_ZERO_STATE_PROMPT: &str = "编写一个连接到 AWS EC2 实例的脚本。";
+const GIT_ZERO_STATE_PROMPT: &str = "如何撤销 Git 中最近的提交？";
+const FILES_ZERO_STATE_PROMPT: &str = "如何查找包含特定文本的所有文件？";
 
 // The placeholder texts are prepended with a space to give them cushion from the cursor.
-const INIT_PLACEHOLDER_TEXT: &str = " Ask a question...";
-const FOLLOWUP_PLACEHOLDER_TEXT: &str = " Type a response or click one above...";
-const RESTART_BUTTON_TEXT: &str = "Restart";
+const INIT_PLACEHOLDER_TEXT: &str = " 提问...";
+const FOLLOWUP_PLACEHOLDER_TEXT: &str = " 输入回复，或点击上方选项...";
+const RESTART_BUTTON_TEXT: &str = "重新开始";
 
 const ASK_AI_BLOCK_INPUT_LIMIT: usize = 100;
 
@@ -127,6 +127,7 @@ pub struct AIAssistantPanelView {
 
     resizable_state_handle: ResizableStateHandle,
     mouse_state_handles: MouseStateHandles,
+    window_id: WindowId,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +250,7 @@ impl AIAssistantPanelView {
 
             resizable_state_handle,
             mouse_state_handles: Default::default(),
+            window_id: ctx.window_id(),
         };
 
         panel.tick(ctx);
@@ -748,22 +750,7 @@ impl AIAssistantPanelView {
             );
         }
 
-        // Add the close button
-        header.add_child(
-            Container::new(
-                icon_button(
-                    appearance,
-                    crate::ui_components::icons::Icon::X,
-                    false,
-                    self.mouse_state_handles.close_panel_state.clone(),
-                )
-                .build()
-                .on_click(|ctx, _, _| ctx.dispatch_typed_action(AIAssistantAction::ClosePanel))
-                .with_cursor(Cursor::PointingHand)
-                .finish(),
-            )
-            .finish(),
-        );
+
 
         header.finish()
     }
@@ -783,7 +770,7 @@ impl AIAssistantPanelView {
                 ..Default::default()
             };
             ui_builder
-                .tool_tip("Copy transcript to clipboard".to_owned())
+                .tool_tip("复制对话记录到剪贴板".to_owned())
                 .with_style(tool_tip_style)
                 .build()
                 .finish()
@@ -986,21 +973,24 @@ impl AIAssistantPanelView {
             .finish(),
         );
 
-        let user_workspaces = UserWorkspaces::as_ref(app);
-        let is_custom_llm_enabled = user_workspaces.is_custom_llm_enabled_for_team(
-            user_workspaces.team_for_view_handle(&self.view_handle, app),
-        );
-
-        if !is_custom_llm_enabled {
-            column.add_child(
-                Container::new(render_request_limit_info(
-                    &self.requests_model,
-                    app,
-                    appearance,
-                ))
-                .with_margin_top(18.)
-                .finish(),
+        #[cfg(not(feature = "skip_login"))]
+        {
+            let user_workspaces = UserWorkspaces::as_ref(app);
+            let is_custom_llm_enabled = user_workspaces.is_custom_llm_enabled_for_team(
+                user_workspaces.team_for_view_handle(&self.view_handle, app),
             );
+
+            if !is_custom_llm_enabled {
+                column.add_child(
+                    Container::new(render_request_limit_info(
+                        &self.requests_model,
+                        app,
+                        appearance,
+                    ))
+                    .with_margin_top(18.)
+                    .finish(),
+                );
+            }
         }
 
         Container::new(column.finish())
@@ -1126,13 +1116,29 @@ impl View for AIAssistantPanelView {
 
         let mut stack = Stack::new().with_child(panel.finish());
 
+        let mut left_padding = PANEL_HORIZONTAL_PADDING;
+        let mut right_padding = PANEL_HORIZONTAL_PADDING;
+
+        if let Some(traffic_light) = crate::util::traffic_lights::traffic_light_data(app, self.window_id) {
+            let zoom_factor = crate::window_settings::WindowSettings::as_ref(app).zoom_level.as_zoom_factor();
+            let width = traffic_light.width(zoom_factor);
+            match traffic_light.side {
+                crate::util::traffic_lights::TrafficLightSide::Left => {
+                    left_padding = (left_padding + width).max(left_padding);
+                }
+                crate::util::traffic_lights::TrafficLightSide::Right => {
+                    right_padding = (right_padding + width).max(right_padding);
+                }
+            }
+        }
+
         stack.add_positioned_overlay_child(
             ConstrainedBox::new(
                 Container::new(self.render_title_bar(appearance, app))
                     .with_padding_top(HEADER_VERTICAL_PADDING)
                     .with_padding_bottom(HEADER_VERTICAL_PADDING)
-                    .with_padding_left(PANEL_HORIZONTAL_PADDING)
-                    .with_padding_right(PANEL_HORIZONTAL_PADDING)
+                    .with_padding_left(left_padding)
+                    .with_padding_right(right_padding)
                     .finish(),
             )
             .with_height(HEADER_HEIGHT)
@@ -1170,18 +1176,6 @@ impl View for AIAssistantPanelView {
                 DispatchEventResult::StopPropagation
             });
 
-        Resizable::new(
-            self.resizable_state_handle.clone(),
-            clickable_panel.finish(),
-        )
-        .on_resize(move |ctx, _| ctx.notify())
-        .with_dragbar_side(DragBarSide::Left)
-        .with_bounds_callback(Box::new(|window_bounds| {
-            (
-                MIN_PANEL_WIDTH,
-                (window_bounds.x() - MIN_REMAINING_WINDOW_SIZE).max(MIN_PANEL_WIDTH),
-            )
-        }))
-        .finish()
+        clickable_panel.finish()
     }
 }

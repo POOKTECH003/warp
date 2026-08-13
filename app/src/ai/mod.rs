@@ -87,3 +87,4 @@ pub fn init(app: &mut AppContext) {
     conversation_details_panel::init(app);
     agent_management::init(app);
 }
+pub mod ollama_sync;
